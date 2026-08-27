@@ -1,0 +1,43 @@
+from __future__ import annotations
+
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from tinyforge.config import Config, ConfigError, load_env_file
+
+
+class ConfigTests(unittest.TestCase):
+    def test_load_env_file_does_not_override_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            env_file = Path(temp) / ".env"
+            env_file.write_text("ONE=file\nTWO='quoted value'\n", encoding="utf-8")
+            with patch.dict(os.environ, {"ONE": "environment"}, clear=True):
+                load_env_file(env_file)
+                self.assertEqual(os.environ["ONE"], "environment")
+                self.assertEqual(os.environ["TWO"], "quoted value")
+
+    def test_missing_api_key_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(ConfigError):
+                    Config.from_env(temp)
+
+    def test_environment_and_overrides_are_combined(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            environment = {
+                "TINYFORGE_API_KEY": "secret",
+                "TINYFORGE_MODEL": "env-model",
+                "TINYFORGE_MAX_ROUNDS": "12",
+            }
+            with patch.dict(os.environ, environment, clear=True):
+                config = Config.from_env(temp, model="cli-model")
+            self.assertEqual(config.api_key, "secret")
+            self.assertEqual(config.model, "cli-model")
+            self.assertEqual(config.max_rounds, 12)
+
+
+if __name__ == "__main__":
+    unittest.main()
