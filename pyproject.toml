@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tinyforge-agent"
+version = "0.1.0"
+description = "A small, auditable coding agent built without agent frameworks"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Student"}]
+dependencies = []
+
+[project.scripts]
+tinyforge = "tinyforge.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["tinyforge*"]
