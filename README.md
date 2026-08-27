@@ -86,7 +86,8 @@ tinyforge --help
 - `tinyforge/config.py`：环境变量、`.env` 和运行限制
 - `tinyforge/cli.py`：终端展示和交互会话
 
-更完整的设计说明和面试问答见 [`docs/design.md`](docs/design.md)。
+更完整的设计说明和面试问答见 [`docs/design.md`](docs/design.md)，录制流程见
+[`docs/demo-script.md`](docs/demo-script.md)。
 
 ## 安全边界
 
