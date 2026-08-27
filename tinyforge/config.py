@@ -44,12 +44,27 @@ def _env_int(name: str, default: int, minimum: int) -> int:
     return parsed
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigError(f"{name} must be true or false")
+
+
 @dataclass(frozen=True, slots=True)
 class Config:
     api_key: str
     base_url: str
     model: str
     workspace: Path
+    wire_api: str = "chat_completions"
+    reasoning_effort: str | None = None
+    store_responses: bool = False
     max_rounds: int = 30
     tool_timeout: int = 60
     request_timeout: int = 120
@@ -72,12 +87,18 @@ class Config:
             or "https://api.openai.com/v1"
         )
         model = os.getenv("TINYFORGE_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
+        wire_api = os.getenv("TINYFORGE_WIRE_API", "chat_completions").strip().lower()
+        if wire_api == "chat":
+            wire_api = "chat_completions"
 
         config = cls(
             api_key=api_key,
             base_url=base_url.rstrip("/"),
             model=model,
             workspace=root,
+            wire_api=wire_api,
+            reasoning_effort=os.getenv("TINYFORGE_REASONING_EFFORT") or None,
+            store_responses=_env_bool("TINYFORGE_STORE_RESPONSES", False),
             max_rounds=_env_int("TINYFORGE_MAX_ROUNDS", 30, 1),
             tool_timeout=_env_int("TINYFORGE_TOOL_TIMEOUT", 60, 1),
             request_timeout=_env_int("TINYFORGE_REQUEST_TIMEOUT", 120, 1),
@@ -97,6 +118,8 @@ class Config:
             )
         if not self.model.strip():
             raise ConfigError("Model name cannot be empty")
+        if self.wire_api not in {"chat_completions", "responses"}:
+            raise ConfigError("TINYFORGE_WIRE_API must be chat_completions or responses")
         if not self.base_url.startswith(("http://", "https://")):
             raise ConfigError("Base URL must start with http:// or https://")
         if not self.workspace.is_dir():

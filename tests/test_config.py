@@ -21,7 +21,9 @@ class ConfigTests(unittest.TestCase):
 
     def test_missing_api_key_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            with patch.dict(os.environ, {}, clear=True):
+            with patch.dict(os.environ, {}, clear=True), patch(
+                "tinyforge.config.load_env_file"
+            ):
                 with self.assertRaises(ConfigError):
                     Config.from_env(temp)
 
@@ -31,12 +33,28 @@ class ConfigTests(unittest.TestCase):
                 "TINYFORGE_API_KEY": "secret",
                 "TINYFORGE_MODEL": "env-model",
                 "TINYFORGE_MAX_ROUNDS": "12",
+                "TINYFORGE_WIRE_API": "responses",
+                "TINYFORGE_REASONING_EFFORT": "xhigh",
+                "TINYFORGE_STORE_RESPONSES": "false",
             }
             with patch.dict(os.environ, environment, clear=True):
                 config = Config.from_env(temp, model="cli-model")
             self.assertEqual(config.api_key, "secret")
             self.assertEqual(config.model, "cli-model")
             self.assertEqual(config.max_rounds, 12)
+            self.assertEqual(config.wire_api, "responses")
+            self.assertEqual(config.reasoning_effort, "xhigh")
+            self.assertFalse(config.store_responses)
+
+    def test_invalid_wire_api_is_rejected(self) -> None:
+        environment = {
+            "TINYFORGE_API_KEY": "secret",
+            "TINYFORGE_WIRE_API": "unknown",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.dict(os.environ, environment, clear=True):
+                with self.assertRaises(ConfigError):
+                    Config.from_env(temp)
 
 
 if __name__ == "__main__":

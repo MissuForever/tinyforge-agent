@@ -18,6 +18,10 @@ CLI 而非 Web UI 是有意取舍：编程任务天然围绕仓库和命令行�
 5. 成功结果或错误都编码成 JSON，使用相同的 `tool_call_id` 回填历史。
 6. Agent 携带新历史再次调用模型，使模型能够观察结果并决定下一步。
 
+内部历史统一使用 Chat 风格，协议适配器在 HTTP 边界转换：Chat Completions 使用嵌套的
+`function` 工具定义和 `tool` 消息；Responses API 使用扁平工具定义，并把调用与结果转换为
+共享 `call_id` 的 `function_call` 和 `function_call_output`。这样 Agent 循环不依赖厂商协议。
+
 工具错误不会抛出到顶层，因为“文件不存在”“替换文本不唯一”“测试失败”都是模型应该
 观察和处理的工作状态。模型 API 无法访问或协议损坏则属于运行时错误，会由 CLI 明确报告。
 

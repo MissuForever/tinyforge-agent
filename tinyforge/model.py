@@ -1,4 +1,4 @@
-"""OpenAI-compatible chat-completions client."""
+"""OpenAI-compatible Chat Completions and Responses API client."""
 
 from __future__ import annotations
 
@@ -48,14 +48,24 @@ class OpenAICompatibleClient:
         base_url: str,
         model: str,
         timeout: int = 120,
+        wire_api: str = "chat_completions",
+        reasoning_effort: str | None = None,
+        store: bool = False,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
+        self.wire_api = wire_api
+        self.reasoning_effort = reasoning_effort
+        self.store = store
 
     @property
     def endpoint(self) -> str:
+        if self.wire_api == "responses":
+            if self.base_url.endswith("/responses"):
+                return self.base_url
+            return f"{self.base_url}/responses"
         if self.base_url.endswith("/chat/completions"):
             return self.base_url
         return f"{self.base_url}/chat/completions"
@@ -65,13 +75,22 @@ class OpenAICompatibleClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
     ) -> AssistantReply:
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
-            "temperature": 0.2,
-        }
+        if self.wire_api == "responses":
+            payload = self._responses_payload(messages, tools)
+        else:
+            payload = {
+                "model": self.model,
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": "auto",
+                "store": self.store,
+            }
+        data = self._post(payload)
+        if self.wire_api == "responses":
+            return self._parse_responses(data)
+        return self._parse_chat_completions(data)
+
+    def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         http_request = request.Request(
             self.endpoint,
@@ -98,9 +117,18 @@ class OpenAICompatibleClient:
 
         try:
             data = json.loads(raw_response)
-            message = data["choices"][0]["message"]
-        except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+            if not isinstance(data, dict):
+                raise TypeError("response root is not an object")
+        except (json.JSONDecodeError, TypeError) as exc:
             raise ModelError(f"Unexpected model response: {raw_response[:2000]}") from exc
+        return data
+
+    @staticmethod
+    def _parse_chat_completions(data: dict[str, Any]) -> AssistantReply:
+        try:
+            message = data["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ModelError(f"Unexpected Chat Completions response: {str(data)[:2000]}") from exc
 
         content = message.get("content") or ""
         if not isinstance(content, str):
@@ -124,3 +152,95 @@ class OpenAICompatibleClient:
                 raise ModelError(f"Malformed tool call in model response: {item!r}") from exc
 
         return AssistantReply(content=content, tool_calls=tuple(calls))
+
+    def _responses_payload(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        response_tools = []
+        for item in tools:
+            function = item["function"]
+            response_tools.append(
+                {
+                    "type": "function",
+                    "name": function["name"],
+                    "description": function.get("description", ""),
+                    "parameters": function.get("parameters", {"type": "object"}),
+                }
+            )
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "input": self._responses_input(messages),
+            "tools": response_tools,
+            "tool_choice": "auto",
+            "store": self.store,
+        }
+        if self.reasoning_effort:
+            payload["reasoning"] = {"effort": self.reasoning_effort}
+        return payload
+
+    @staticmethod
+    def _responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for message in messages:
+            role = message.get("role")
+            content = message.get("content")
+            if role in {"system", "developer", "user"}:
+                items.append({"role": role, "content": content or ""})
+            elif role == "assistant":
+                if content:
+                    items.append({"role": "assistant", "content": content})
+                for call in message.get("tool_calls") or []:
+                    function = call["function"]
+                    items.append(
+                        {
+                            "type": "function_call",
+                            "call_id": call["id"],
+                            "name": function["name"],
+                            "arguments": function.get("arguments", "{}"),
+                        }
+                    )
+            elif role == "tool":
+                items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": message["tool_call_id"],
+                        "output": content or "",
+                    }
+                )
+        return items
+
+    @staticmethod
+    def _parse_responses(data: dict[str, Any]) -> AssistantReply:
+        content_parts: list[str] = []
+        calls: list[ToolCall] = []
+        output = data.get("output")
+        if not isinstance(output, list):
+            raise ModelError(f"Unexpected Responses API response: {str(data)[:2000]}")
+        for index, item in enumerate(output):
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "function_call":
+                arguments = item.get("arguments", "{}")
+                if not isinstance(arguments, str):
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                try:
+                    calls.append(
+                        ToolCall(
+                            id=str(item.get("call_id") or item.get("id") or f"call_{index}"),
+                            name=str(item["name"]),
+                            arguments=arguments,
+                        )
+                    )
+                except KeyError as exc:
+                    raise ModelError(f"Malformed Responses function call: {item!r}") from exc
+            elif item.get("type") == "message":
+                for part in item.get("content") or []:
+                    if isinstance(part, dict) and part.get("type") == "output_text":
+                        text = part.get("text")
+                        if isinstance(text, str):
+                            content_parts.append(text)
+        if not content_parts and isinstance(data.get("output_text"), str):
+            content_parts.append(data["output_text"])
+        return AssistantReply(content="\n".join(content_parts), tool_calls=tuple(calls))

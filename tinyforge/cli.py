@@ -88,6 +88,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-w", "--workspace", default=".", help="Workspace directory")
     parser.add_argument("--model", help="Override TINYFORGE_MODEL")
     parser.add_argument("--base-url", help="Override TINYFORGE_BASE_URL")
+    parser.add_argument(
+        "--wire-api",
+        choices=("chat_completions", "responses"),
+        help="Model protocol (default: TINYFORGE_WIRE_API or chat_completions)",
+    )
+    parser.add_argument("--reasoning-effort", help="Reasoning effort for the Responses API")
     parser.add_argument("--max-rounds", type=int, help="Maximum model/tool rounds")
     parser.add_argument("--tool-timeout", type=int, help="Default command timeout in seconds")
     parser.add_argument(
@@ -105,6 +111,8 @@ def create_agent(args: argparse.Namespace, console: Console) -> Agent:
     overrides: dict[str, Any] = {
         "model": args.model,
         "base_url": args.base_url.rstrip("/") if args.base_url else None,
+        "wire_api": args.wire_api,
+        "reasoning_effort": args.reasoning_effort,
         "max_rounds": args.max_rounds,
         "tool_timeout": args.tool_timeout,
         "allow_dangerous": args.allow_dangerous,
@@ -115,6 +123,9 @@ def create_agent(args: argparse.Namespace, console: Console) -> Agent:
         base_url=config.base_url,
         model=config.model,
         timeout=config.request_timeout,
+        wire_api=config.wire_api,
+        reasoning_effort=config.reasoning_effort,
+        store=config.store_responses,
     )
     tools = WorkspaceTools(
         config.workspace,
@@ -124,7 +135,9 @@ def create_agent(args: argparse.Namespace, console: Console) -> Agent:
     )
     print(
         console.paint("TinyForge", "cyan"),
-        console.paint(f"model={config.model} workspace={config.workspace}", "dim"),
+        console.paint(
+            f"model={config.model} api={config.wire_api} workspace={config.workspace}", "dim"
+        ),
     )
     return Agent(
         model=model,

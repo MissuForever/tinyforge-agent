@@ -1,8 +1,8 @@
 # TinyForge
 
 TinyForge 是一个不依赖 Agent 框架的本地编程智能体。它直接调用 OpenAI 兼容的
-Chat Completions 接口，解析模型原生 tool calling，在本机完成文件检索、精确编辑和
-命令执行，再把结果送回模型，循环直到任务完成。
+Chat Completions 或 Responses API，解析模型原生 tool calling，在本机完成文件检索、
+精确编辑和命令执行，再把结果送回模型，循环直到任务完成。
 
 项目的重点不是封装现成产品，而是用少量、可审计的代码完整展示 Agent Runtime：
 消息管理、工具协议、执行循环、上下文控制、错误恢复和终止策略均由项目自行实现。
@@ -35,10 +35,22 @@ Copy-Item .env.example .env
 TINYFORGE_API_KEY=your-api-key
 TINYFORGE_BASE_URL=https://api.openai.com/v1
 TINYFORGE_MODEL=gpt-4o-mini
+TINYFORGE_WIRE_API=chat_completions
 ```
 
-也可以使用任何支持 OpenAI Chat Completions 与原生 tool calling 的兼容网关。`.env`
-已经被 Git 忽略；环境变量优先于文件配置。
+Responses API 配置示例：
+
+```dotenv
+TINYFORGE_API_KEY=your-api-key
+TINYFORGE_BASE_URL=https://your-compatible-provider.example/v1
+TINYFORGE_MODEL=your-model
+TINYFORGE_WIRE_API=responses
+TINYFORGE_REASONING_EFFORT=xhigh
+TINYFORGE_STORE_RESPONSES=false
+```
+
+也可以使用任何支持上述协议和原生 tool calling 的兼容网关。`.env` 已经被 Git 忽略；
+环境变量优先于文件配置。命令行可通过 `--wire-api` 和 `--reasoning-effort` 临时覆盖。
 
 2. 直接运行单个任务：
 
@@ -80,7 +92,7 @@ tinyforge --help
 主要模块：
 
 - `tinyforge/agent.py`：Agent 循环、事件、循环终止
-- `tinyforge/model.py`：兼容接口的 HTTP 请求与响应解析
+- `tinyforge/model.py`：两种兼容协议的请求转换、HTTP 调用与响应解析
 - `tinyforge/tools.py`：工具定义、参数处理和本地执行
 - `tinyforge/context.py`：按完整工具轮次裁剪历史
 - `tinyforge/config.py`：环境变量、`.env` 和运行限制
@@ -131,7 +143,7 @@ py -3 -m tinyforge -w .demo/order_total "阅读 README 和测试，修复订单�
 
 ## 已知边界
 
-- 当前只实现 OpenAI 兼容的非流式 Chat Completions 协议。
+- 当前实现非流式 Chat Completions 与 Responses API，不包含流式事件解析。
 - 上下文大小按字符近似而非厂商 tokenizer 计算。
 - 危险命令检测基于规则，不能代替容器级隔离。
 - 工具面向文本项目，不读取或编辑二进制文件。
