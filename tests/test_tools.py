@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tinyforge.memory import WorkingMemory
 from tinyforge.tools import WorkspaceTools
 
 
@@ -78,6 +79,57 @@ class WorkspaceToolsTests(unittest.TestCase):
         payload = json.loads(raw)
         self.assertLessEqual(len(raw), 1_000)
         self.assertTrue(payload["result"]["truncated"])
+        self.assertEqual(payload["result"]["path"], "large.txt")
+        self.assertEqual(payload["result"]["total_lines"], 500)
+
+    def test_large_failed_command_keeps_exit_code_and_is_not_evidence(self) -> None:
+        tools = WorkspaceTools(self.root, max_output=1_000)
+        executable = (
+            f'& "{sys.executable}"' if os.name == "nt" else shlex.quote(sys.executable)
+        )
+        (self.root / "large_failure.py").write_text(
+            "import sys\nprint('x' * 5000)\nsys.exit(7)\n", encoding="utf-8"
+        )
+        command = f"{executable} large_failure.py"
+
+        raw = tools.execute("run_command", json.dumps({"command": command}))
+        payload = json.loads(raw)
+
+        self.assertLessEqual(len(raw), 1_000)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["result"]["truncated"])
+        self.assertEqual(payload["result"]["command"], command)
+        self.assertEqual(payload["result"]["cwd"], ".")
+        self.assertNotEqual(payload["result"]["exit_code"], 0)
+
+        memory = WorkingMemory()
+        memory.start("Run a failing command with large output")
+        memory.record_tool("run_command", raw)
+        self.assertEqual(memory.evidence, {})
+
+    def test_truncated_command_cannot_become_verification_evidence(self) -> None:
+        tools = WorkspaceTools(self.root, max_output=1_000)
+        command = "pytest " + "case " * 100 + "--fix"
+        raw = tools._serialize_payload(
+            {
+                "ok": True,
+                "result": {
+                    "command": command,
+                    "cwd": ".",
+                    "exit_code": 0,
+                    "stdout": "x" * 5_000,
+                    "stderr": "",
+                },
+                "elapsed_ms": 1,
+            }
+        )
+        payload = json.loads(raw)
+        self.assertTrue(payload["result"]["command_truncated"])
+
+        memory = WorkingMemory()
+        memory.start("Do not trust truncated command metadata")
+        memory.record_tool("run_command", raw)
+        self.assertFalse(memory.evidence["e1"].verifies_code)
 
 
 if __name__ == "__main__":

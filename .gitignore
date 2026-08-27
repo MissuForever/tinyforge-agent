@@ -9,6 +9,8 @@ dist/
 .venv/
 venv/
 .env
+.tinyforge-state/
 .demo/
+Agent论文/
 .idea/
 .vscode/

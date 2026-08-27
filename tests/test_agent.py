@@ -9,8 +9,9 @@ import unittest
 from pathlib import Path
 
 from tinyforge.agent import Agent, AgentEvent
-from tinyforge.model import AssistantReply, ToolCall
-from tinyforge.tools import WorkspaceTools
+from tinyforge.memory import MemoryRuntime, MemoryStore
+from tinyforge.model import AssistantReply, ModelUsage, ToolCall
+from tinyforge.tools import CompositeTools, WorkspaceTools
 
 
 class ScriptedModel:
@@ -38,7 +39,7 @@ class AgentTests(unittest.TestCase):
                             ),
                         ),
                     ),
-                    AssistantReply("Created answer.txt and verified its content."),
+                    AssistantReply("TASK_COMPLETE: Created answer.txt and verified its content."),
                 ]
             )
             events: list[AgentEvent] = []
@@ -78,6 +79,26 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(result.rounds, 3)
         self.assertIn("repeated", result.answer)
 
+    def test_repeated_call_detection_uses_canonical_json(self) -> None:
+        arguments = [
+            '{"path":".","max_depth":1}',
+            '{"max_depth":1,"path":"."}',
+            '{ "path": ".", "max_depth": 1 }',
+        ]
+        replies = [
+            AssistantReply("", (ToolCall(f"call_{index}", "list_files", value),))
+            for index, value in enumerate(arguments)
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            agent = Agent(
+                model=ScriptedModel(replies),
+                tools=WorkspaceTools(Path(temp)),
+                workspace=Path(temp),
+            )
+            result = agent.run("Repeat with reordered JSON")
+        self.assertFalse(result.success)
+        self.assertEqual(result.rounds, 3)
+
     def test_empty_task_does_not_call_model(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             model = ScriptedModel([])
@@ -89,6 +110,31 @@ class AgentTests(unittest.TestCase):
             result = agent.run("   ")
         self.assertFalse(result.success)
         self.assertEqual(model.calls, [])
+
+    def test_model_usage_is_aggregated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            model = ScriptedModel(
+                [
+                    AssistantReply(
+                        "TASK_COMPLETE: Done.",
+                        usage=ModelUsage(
+                            input_tokens=125,
+                            output_tokens=25,
+                            total_tokens=150,
+                            cached_input_tokens=80,
+                        ),
+                    )
+                ]
+            )
+            agent = Agent(
+                model=model,
+                tools=WorkspaceTools(Path(temp)),
+                workspace=Path(temp),
+            )
+            result = agent.run("Answer briefly")
+        self.assertEqual(result.input_tokens, 125)
+        self.assertEqual(result.output_tokens, 25)
+        self.assertEqual(result.cached_input_tokens, 80)
 
     def test_scripted_coding_task_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -147,7 +193,9 @@ class AgentTests(unittest.TestCase):
                             ),
                         ),
                     ),
-                    AssistantReply("Fixed calculator.py; the complete test suite passes."),
+                    AssistantReply(
+                        "TASK_COMPLETE: Fixed calculator.py; the complete test suite passes."
+                    ),
                 ]
             )
             agent = Agent(
@@ -162,6 +210,158 @@ class AgentTests(unittest.TestCase):
             self.assertIn("left + right", (root / "calculator.py").read_text(encoding="utf-8"))
             command_payload = json.loads(model.calls[3][-1]["content"])
             self.assertEqual(command_payload["result"]["exit_code"], 0)
+
+    def test_verified_memory_is_visible_to_a_fresh_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            state = root / "state"
+            executable = (
+                f'& "{sys.executable}"'
+                if os.name == "nt"
+                else shlex.quote(sys.executable)
+            )
+            memory = MemoryRuntime(MemoryStore(state, workspace))
+            tools = CompositeTools(WorkspaceTools(workspace), memory)
+            model = ScriptedModel(
+                [
+                    AssistantReply(
+                        "Creating the implementation.",
+                        (
+                            ToolCall(
+                                "write",
+                                "write_file",
+                                json.dumps(
+                                    {"path": "answer.py", "content": "ANSWER = 42\n"}
+                                ),
+                            ),
+                        ),
+                    ),
+                    AssistantReply(
+                        "Verifying it.",
+                        (
+                            ToolCall(
+                                "verify",
+                                "run_command",
+                                json.dumps(
+                                    {
+                                        "command": f'{executable} -c "import answer; assert answer.ANSWER == 42"'
+                                    }
+                                ),
+                            ),
+                        ),
+                    ),
+                    AssistantReply(
+                        "Saving the verified workflow.",
+                        (
+                            ToolCall(
+                                "remember",
+                                "stage_memory",
+                                json.dumps(
+                                    {
+                                        "kind": "sop",
+                                        "title": "Verify answer module",
+                                        "content": (
+                                            "After changing answer.py, import the module and assert "
+                                            "that ANSWER equals 42 before reporting completion."
+                                        ),
+                                        "keywords": ["answer.py", "verification"],
+                                        "evidence_ids": ["e2"],
+                                    }
+                                ),
+                            ),
+                        ),
+                    ),
+                    AssistantReply("TASK_COMPLETE: Implementation and verification are complete."),
+                ]
+            )
+            first_agent = Agent(
+                model=model,
+                tools=tools,
+                workspace=workspace,
+                memory=memory,
+            )
+            result = first_agent.run("Create and verify answer.py")
+            self.assertTrue(result.success)
+            self.assertIn("e1=write_file", model.calls[1][0]["content"])
+
+            fresh_memory = MemoryRuntime(MemoryStore(state, workspace))
+            fresh_model = ScriptedModel(
+                [AssistantReply("TASK_COMPLETE: I found the stored SOP index.")]
+            )
+            fresh_agent = Agent(
+                model=fresh_model,
+                tools=CompositeTools(WorkspaceTools(workspace), fresh_memory),
+                workspace=workspace,
+                memory=fresh_memory,
+            )
+            fresh_result = fresh_agent.run("What do we know about answer.py?")
+            self.assertTrue(fresh_result.success)
+            self.assertIn("Verify answer module", fresh_model.calls[0][0]["content"])
+
+    def test_missing_or_blocked_completion_status_is_not_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            missing = Agent(
+                model=ScriptedModel(
+                    [AssistantReply("I could not finish."), AssistantReply("Still incomplete.")]
+                ),
+                tools=WorkspaceTools(Path(temp)),
+                workspace=Path(temp),
+            ).run("Try the task")
+            blocked = Agent(
+                model=ScriptedModel([AssistantReply("TASK_BLOCKED: dependency unavailable")]),
+                tools=WorkspaceTools(Path(temp)),
+                workspace=Path(temp),
+            ).run("Try the task")
+        self.assertFalse(missing.success)
+        self.assertIn("required", missing.answer)
+        self.assertFalse(blocked.success)
+        self.assertEqual(blocked.answer, "dependency unavailable")
+
+    def test_missing_completion_status_is_repaired_once(self) -> None:
+        model = ScriptedModel(
+            [
+                AssistantReply("The requested inspection is complete."),
+                AssistantReply("TASK_COMPLETE: The requested inspection is complete."),
+            ]
+        )
+        events: list[AgentEvent] = []
+        with tempfile.TemporaryDirectory() as temp:
+            result = Agent(
+                model=model,
+                tools=WorkspaceTools(Path(temp)),
+                workspace=Path(temp),
+                on_event=events.append,
+            ).run("Inspect the project")
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.rounds, 2)
+        self.assertEqual(model.calls[1][-1]["role"], "user")
+        self.assertIn("TASK_COMPLETE:", model.calls[1][-1]["content"])
+        self.assertEqual([event.kind for event in events].count("completion_repair"), 1)
+
+    def test_tool_argument_events_redact_credentials(self) -> None:
+        secret = "sk-" + "abcdefghijklmnopqrstuvwxyz123456"
+        arguments = json.dumps(
+            {
+                "api_key": secret,
+                "command": f"tool password={secret}",
+                "content": "DATABASE_URL=postgres://user:database-password@host/db",
+            }
+        )
+        safe = Agent._safe_arguments(arguments)
+        serialized = json.dumps(safe)
+        self.assertNotIn(secret, serialized)
+        self.assertNotIn("database-password", serialized)
+        self.assertIn("REDACTED", serialized)
+
+    def test_final_answer_redacts_credentials(self) -> None:
+        secret = "sk-" + "abcdefghijklmnopqrstuvwxyz123456"
+        success, answer = Agent._parse_completion(f"TASK_COMPLETE: key={secret}")
+        self.assertTrue(success)
+        self.assertNotIn(secret, answer)
+        self.assertIn("REDACTED", answer)
 
 
 if __name__ == "__main__":

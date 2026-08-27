@@ -41,7 +41,10 @@ class ScriptedHandler(BaseHTTPRequestHandler):
                         "type": "message",
                         "role": "assistant",
                         "content": [
-                            {"type": "output_text", "text": "Responses task complete."}
+                            {
+                                "type": "output_text",
+                                "text": "TASK_COMPLETE: Responses task complete.",
+                            }
                         ],
                     }
                 ]
@@ -67,7 +70,7 @@ class ScriptedHandler(BaseHTTPRequestHandler):
         else:
             message = {
                 "role": "assistant",
-                "content": "Created from_http.txt successfully.",
+                "content": "TASK_COMPLETE: Created from_http.txt successfully.",
             }
             payload = {"choices": [{"message": message}]}
         response = json.dumps(payload).encode("utf-8")
@@ -107,6 +110,7 @@ class CliIntegrationTests(unittest.TestCase):
                         "chat_completions",
                         "--workspace",
                         workspace,
+                        "--no-memory",
                         "Create from_http.txt",
                     ],
                     cwd=project_root,
@@ -159,6 +163,7 @@ class CliIntegrationTests(unittest.TestCase):
                         "xhigh",
                         "--workspace",
                         workspace,
+                        "--no-memory",
                         "Create from_responses.txt",
                     ],
                     cwd=project_root,

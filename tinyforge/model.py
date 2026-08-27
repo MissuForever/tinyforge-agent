@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from urllib import error, request
 
@@ -27,9 +27,18 @@ class ToolCall:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    cached_input_tokens: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class AssistantReply:
     content: str
     tool_calls: tuple[ToolCall, ...] = ()
+    usage: ModelUsage = field(default_factory=ModelUsage)
 
     def as_message(self) -> dict[str, Any]:
         message: dict[str, Any] = {"role": "assistant", "content": self.content or None}
@@ -151,7 +160,11 @@ class OpenAICompatibleClient:
             except (KeyError, TypeError) as exc:
                 raise ModelError(f"Malformed tool call in model response: {item!r}") from exc
 
-        return AssistantReply(content=content, tool_calls=tuple(calls))
+        return AssistantReply(
+            content=content,
+            tool_calls=tuple(calls),
+            usage=OpenAICompatibleClient._parse_usage(data, responses=False),
+        )
 
     def _responses_payload(
         self,
@@ -243,4 +256,30 @@ class OpenAICompatibleClient:
                             content_parts.append(text)
         if not content_parts and isinstance(data.get("output_text"), str):
             content_parts.append(data["output_text"])
-        return AssistantReply(content="\n".join(content_parts), tool_calls=tuple(calls))
+        return AssistantReply(
+            content="\n".join(content_parts),
+            tool_calls=tuple(calls),
+            usage=OpenAICompatibleClient._parse_usage(data, responses=True),
+        )
+
+    @staticmethod
+    def _parse_usage(data: dict[str, Any], *, responses: bool) -> ModelUsage:
+        usage = data.get("usage")
+        if not isinstance(usage, dict):
+            return ModelUsage()
+        if responses:
+            input_tokens = int(usage.get("input_tokens") or 0)
+            output_tokens = int(usage.get("output_tokens") or 0)
+            details = usage.get("input_tokens_details") or {}
+        else:
+            input_tokens = int(usage.get("prompt_tokens") or 0)
+            output_tokens = int(usage.get("completion_tokens") or 0)
+            details = usage.get("prompt_tokens_details") or {}
+        cached = int(details.get("cached_tokens") or 0) if isinstance(details, dict) else 0
+        total = int(usage.get("total_tokens") or input_tokens + output_tokens)
+        return ModelUsage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total,
+            cached_input_tokens=cached,
+        )

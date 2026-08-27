@@ -7,6 +7,6 @@ py -3 -m tinyforge "你的编程任务"
 操作其他项目可增加 -w 项目路径；不提供任务则进入连续对话。运行测试：
 py -3 -m unittest discover -s tests -v
 
-特色：项目不依赖任何 Agent 框架或服务端文件工具，自行实现兼容 Chat Completions 和 Responses API 的原生 tool calling 循环。Agent 可浏览、读取、搜索、创建和精确编辑本地文件，并执行测试或构建命令。工具错误会结构化回传给模型，使其能够自行修正。文件路径被限制在工作区内，命令具有超时和危险操作拦截；同时具备工具输出截断、上下文裁剪、最大轮数和重复调用保护。
+特色：项目不依赖任何 Agent 框架或服务端文件工具，自行实现兼容 Chat Completions 和 Responses API 的原生 tool calling 循环。Agent 可读写代码、运行测试并根据反馈继续修复。参考 GenericAgent 论文实现有界工作检查点和 L1 索引、L2 事实、L3 SOP、L4 会话档案；深层记忆按需读取，只有带成功工具证据且任务最终成功的知识才会提交。系统还具备工作区隔离、命令超时、危险操作拦截、分层上下文压缩、循环保护和 Token/耗时统计。
 
 演示：执行 py -3 scripts/prepare_demo.py 生成带缺陷的订单计价项目，再让 TinyForge 阅读需求和测试、修复实现并运行测试验证。详细设计、限制和安全说明见仓库 README.md 与 docs/design.md。

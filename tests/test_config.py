@@ -36,6 +36,10 @@ class ConfigTests(unittest.TestCase):
                 "TINYFORGE_WIRE_API": "responses",
                 "TINYFORGE_REASONING_EFFORT": "xhigh",
                 "TINYFORGE_STORE_RESPONSES": "false",
+                "TINYFORGE_STATE_DIR": temp,
+                "TINYFORGE_MEMORY_ENABLED": "true",
+                "TINYFORGE_ARCHIVE_SESSIONS": "false",
+                "TINYFORGE_MAX_CONTEXT_TOKENS": "24000",
             }
             with patch.dict(os.environ, environment, clear=True):
                 config = Config.from_env(temp, model="cli-model")
@@ -45,6 +49,10 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.wire_api, "responses")
             self.assertEqual(config.reasoning_effort, "xhigh")
             self.assertFalse(config.store_responses)
+            self.assertEqual(config.state_dir, Path(temp).resolve())
+            self.assertTrue(config.memory_enabled)
+            self.assertFalse(config.archive_sessions)
+            self.assertEqual(config.max_context_tokens, 24_000)
 
     def test_invalid_wire_api_is_rejected(self) -> None:
         environment = {

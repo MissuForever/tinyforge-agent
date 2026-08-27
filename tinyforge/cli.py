@@ -12,8 +12,9 @@ from typing import Any, Sequence
 from . import __version__
 from .agent import Agent, AgentEvent
 from .config import Config, ConfigError
+from .memory import MemoryRuntime, MemoryStore, redact_secrets
 from .model import ModelError, OpenAICompatibleClient
-from .tools import WorkspaceTools
+from .tools import CompositeTools, WorkspaceTools
 
 
 class Console:
@@ -56,27 +57,51 @@ class Console:
             print(self.paint(f"[context] removed {event.data['removed']} old messages", "dim"))
         elif event.kind == "loop_stopped":
             print(self.paint(f"[stopped] {event.data['reason']}", "red"))
+        elif event.kind == "memory_committed":
+            print(
+                self.paint(
+                    f"[memory] committed {event.data['count']} verified entries", "green"
+                )
+            )
+        elif event.kind == "memory_error":
+            print(self.paint(f"[memory error] {event.data['error']}", "red"))
 
     @staticmethod
     def _tool_summary(output: str) -> tuple[bool, str]:
         try:
             payload = json.loads(output)
         except json.JSONDecodeError:
-            return False, output[:300]
+            return False, redact_secrets(output[:300])
         if not payload.get("ok"):
-            return False, str(payload.get("error", "unknown tool error"))[:500]
+            return False, redact_secrets(
+                str(payload.get("error", "unknown tool error"))[:500]
+            )
         result = payload.get("result", {})
         if isinstance(result, dict):
             if "exit_code" in result:
-                stdout = str(result.get("stdout", "")).strip().replace("\n", " | ")
+                stdout = redact_secrets(
+                    str(result.get("stdout", "")).strip().replace("\n", " | ")
+                )
                 return result["exit_code"] == 0, (
                     f"exit={result['exit_code']}" + (f"; {stdout[:350]}" if stdout else "")
                 )
             if "path" in result:
-                return True, str(result["path"])
+                return True, redact_secrets(str(result["path"]))
             if "matches" in result:
                 return True, f"{len(result['matches'])} matches"
         return True, "completed"
+
+    def result_stats(self, result: Any) -> None:
+        token_text = f"tokens={result.input_tokens}+{result.output_tokens}"
+        if result.cached_input_tokens:
+            token_text += f" cached={result.cached_input_tokens}"
+        print(
+            self.paint(
+                f"[stats] requests={result.rounds} tools={result.tool_calls} "
+                f"{token_text} elapsed={result.elapsed_ms / 1000:.1f}s",
+                "dim",
+            )
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -96,6 +121,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reasoning-effort", help="Reasoning effort for the Responses API")
     parser.add_argument("--max-rounds", type=int, help="Maximum model/tool rounds")
     parser.add_argument("--tool-timeout", type=int, help="Default command timeout in seconds")
+    parser.add_argument("--state-dir", help="Persistent state directory (default: ~/.tinyforge)")
+    parser.add_argument("--no-memory", action="store_true", help="Disable persistent memory")
+    parser.add_argument(
+        "--no-session-archive",
+        action="store_true",
+        help="Keep memory but disable L4 session archives",
+    )
     parser.add_argument(
         "--allow-dangerous",
         action="store_true",
@@ -116,6 +148,9 @@ def create_agent(args: argparse.Namespace, console: Console) -> Agent:
         "max_rounds": args.max_rounds,
         "tool_timeout": args.tool_timeout,
         "allow_dangerous": args.allow_dangerous,
+        "state_dir": Path(args.state_dir).expanduser().resolve() if args.state_dir else None,
+        "memory_enabled": False if args.no_memory else None,
+        "archive_sessions": False if args.no_session_archive else None,
     }
     config = Config.from_env(args.workspace, **overrides)
     model = OpenAICompatibleClient(
@@ -127,16 +162,30 @@ def create_agent(args: argparse.Namespace, console: Console) -> Agent:
         reasoning_effort=config.reasoning_effort,
         store=config.store_responses,
     )
-    tools = WorkspaceTools(
+    workspace_tools = WorkspaceTools(
         config.workspace,
         command_timeout=config.tool_timeout,
         max_output=config.max_tool_output,
         allow_dangerous=config.allow_dangerous,
     )
+    memory = None
+    if config.memory_enabled:
+        memory = MemoryRuntime(
+            MemoryStore(
+                config.state_dir,
+                config.workspace,
+                archive_sessions=config.archive_sessions,
+            )
+        )
+        tools = CompositeTools(workspace_tools, memory)
+    else:
+        tools = workspace_tools
     print(
         console.paint("TinyForge", "cyan"),
         console.paint(
-            f"model={config.model} api={config.wire_api} workspace={config.workspace}", "dim"
+            f"model={config.model} api={config.wire_api} "
+            f"memory={'on' if memory else 'off'} workspace={config.workspace}",
+            "dim",
         ),
     )
     return Agent(
@@ -145,12 +194,14 @@ def create_agent(args: argparse.Namespace, console: Console) -> Agent:
         workspace=config.workspace,
         max_rounds=config.max_rounds,
         max_context_chars=config.max_context_chars,
+        max_context_tokens=config.max_context_tokens,
         on_event=console.event,
+        memory=memory,
     )
 
 
 def interactive(agent: Agent, console: Console) -> int:
-    print("Enter a programming task. Commands: /new, /help, /exit")
+    print("Enter a programming task. Commands: /new, /memory, /help, /exit")
     continuing = False
     while True:
         try:
@@ -168,12 +219,19 @@ def interactive(agent: Agent, console: Console) -> int:
             print("Started a new session.")
             continue
         if task == "/help":
-            print("/new clears conversation context; /exit closes TinyForge.")
+            print(
+                "/new clears conversation context; /memory shows the working and persistent "
+                "memory index; /exit closes TinyForge."
+            )
+            continue
+        if task == "/memory":
+            print(agent.memory_overview())
             continue
         result = agent.run(task, continue_session=continuing)
         continuing = True
         color = "green" if result.success else "red"
         print(console.paint("\n[final]", color), result.answer)
+        console.result_stats(result)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -185,6 +243,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = agent.run(" ".join(args.task))
             color = "green" if result.success else "red"
             print(console.paint("\n[final]", color), result.answer)
+            console.result_stats(result)
             return 0 if result.success else 1
         return interactive(agent, console)
     except (ConfigError, ModelError) as exc:

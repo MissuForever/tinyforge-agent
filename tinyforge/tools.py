@@ -37,6 +37,30 @@ class Tool:
         }
 
 
+class CompositeTools:
+    """Expose several small tool providers through one Agent tool interface."""
+
+    def __init__(self, *providers: Any) -> None:
+        self.providers = providers
+        self._routes: dict[str, Any] = {}
+        for provider in providers:
+            for definition in provider.definitions:
+                name = str(definition["function"]["name"])
+                if name in self._routes:
+                    raise ValueError(f"Duplicate tool name: {name}")
+                self._routes[name] = provider
+
+    @property
+    def definitions(self) -> list[dict[str, Any]]:
+        return [definition for provider in self.providers for definition in provider.definitions]
+
+    def execute(self, name: str, arguments: str) -> str:
+        provider = self._routes.get(name)
+        if provider is None:
+            return json.dumps({"ok": False, "error": f"Unknown tool: {name}"})
+        return str(provider.execute(name, arguments))
+
+
 class WorkspaceTools:
     def __init__(
         self,
@@ -115,20 +139,69 @@ class WorkspaceTools:
         marker = f"\n... output truncated ({len(value) - self.max_output} characters omitted) ...\n"
         head_size = self.max_output * 2 // 3
         tail_size = self.max_output - head_size - len(marker)
-        return value[:head_size] + marker + value[-max(tail_size, 0) :]
+        suffix = value[-tail_size:] if tail_size > 0 else ""
+        return (value[:head_size] + marker + suffix)[: self.max_output]
 
     def _serialize_payload(self, payload: dict[str, Any]) -> str:
         encoded = json.dumps(payload, ensure_ascii=False)
         if len(encoded) <= self.max_output:
             return encoded
-        # Keep the outer response machine-readable even when a large file or command floods output.
-        preview = self._truncate(encoded[: self.max_output // 3] + encoded[-self.max_output // 6 :])
+
+        # Preserve metadata consumed by the agent even when large text fields flood the response.
+        result = payload.get("result")
+        compact_result: dict[str, Any] = {"truncated": True}
+        string_limit = max(40, min(240, self.max_output // 6))
+        if isinstance(result, dict):
+            metadata_keys = (
+                "command",
+                "cwd",
+                "exit_code",
+                "path",
+                "start_line",
+                "end_line",
+                "total_lines",
+                "replacements",
+                "characters_written",
+                "lines",
+                "skipped_files",
+            )
+            for key in metadata_keys:
+                value = result.get(key)
+                if isinstance(value, str):
+                    if len(value) <= string_limit:
+                        compact_result[key] = value
+                    else:
+                        compact_result[key] = value[: string_limit - 3] + "..."
+                        if key == "command":
+                            compact_result["command_truncated"] = True
+                elif value is None or isinstance(value, (bool, int, float)):
+                    if key in result:
+                        compact_result[key] = value
+
         compact = {
             "ok": payload.get("ok", False),
-            "result": {"truncated": True, "preview": preview},
+            "result": compact_result,
             "elapsed_ms": payload.get("elapsed_ms", 0),
         }
-        return json.dumps(compact, ensure_ascii=False)
+        if "error" in payload:
+            compact["error"] = str(payload["error"])[:string_limit]
+
+        # Use only the space left after metadata for a diagnostic head/tail preview.
+        base = json.dumps(compact, ensure_ascii=False)
+        preview_budget = max(0, self.max_output - len(base) - 30)
+        if preview_budget:
+            preview = encoded[: preview_budget * 2 // 3] + encoded[-preview_budget // 3 :]
+            compact_result["preview"] = preview
+            compact_encoded = json.dumps(compact, ensure_ascii=False)
+            while len(compact_encoded) > self.max_output and preview:
+                preview = preview[: -max(1, len(compact_encoded) - self.max_output)]
+                compact_result["preview"] = preview
+                compact_encoded = json.dumps(compact, ensure_ascii=False)
+            if not preview:
+                compact_result.pop("preview", None)
+                compact_encoded = json.dumps(compact, ensure_ascii=False)
+            return compact_encoded
+        return base
 
     def _build_tools(self) -> dict[str, Tool]:
         object_schema = {"type": "object", "additionalProperties": False}

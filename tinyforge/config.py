@@ -56,12 +56,20 @@ def _env_bool(name: str, default: bool) -> bool:
     raise ConfigError(f"{name} must be true or false")
 
 
+def _default_state_dir() -> Path:
+    try:
+        return Path.home() / ".tinyforge"
+    except RuntimeError:
+        return Path.cwd() / ".tinyforge-state"
+
+
 @dataclass(frozen=True, slots=True)
 class Config:
     api_key: str
     base_url: str
     model: str
     workspace: Path
+    state_dir: Path
     wire_api: str = "chat_completions"
     reasoning_effort: str | None = None
     store_responses: bool = False
@@ -70,7 +78,10 @@ class Config:
     request_timeout: int = 120
     max_tool_output: int = 30_000
     max_context_chars: int = 150_000
+    max_context_tokens: int = 30_000
     allow_dangerous: bool = False
+    memory_enabled: bool = True
+    archive_sessions: bool = True
 
     @classmethod
     def from_env(cls, workspace: str | Path = ".", **overrides: object) -> "Config":
@@ -90,12 +101,16 @@ class Config:
         wire_api = os.getenv("TINYFORGE_WIRE_API", "chat_completions").strip().lower()
         if wire_api == "chat":
             wire_api = "chat_completions"
+        state_dir = Path(
+            os.getenv("TINYFORGE_STATE_DIR") or _default_state_dir()
+        ).expanduser().resolve()
 
         config = cls(
             api_key=api_key,
             base_url=base_url.rstrip("/"),
             model=model,
             workspace=root,
+            state_dir=state_dir,
             wire_api=wire_api,
             reasoning_effort=os.getenv("TINYFORGE_REASONING_EFFORT") or None,
             store_responses=_env_bool("TINYFORGE_STORE_RESPONSES", False),
@@ -104,6 +119,9 @@ class Config:
             request_timeout=_env_int("TINYFORGE_REQUEST_TIMEOUT", 120, 1),
             max_tool_output=_env_int("TINYFORGE_MAX_TOOL_OUTPUT", 30_000, 1_000),
             max_context_chars=_env_int("TINYFORGE_MAX_CONTEXT_CHARS", 150_000, 10_000),
+            max_context_tokens=_env_int("TINYFORGE_MAX_CONTEXT_TOKENS", 30_000, 2_000),
+            memory_enabled=_env_bool("TINYFORGE_MEMORY_ENABLED", True),
+            archive_sessions=_env_bool("TINYFORGE_ARCHIVE_SESSIONS", True),
         )
         known_overrides = {key: value for key, value in overrides.items() if value is not None}
         if known_overrides:

@@ -33,6 +33,12 @@ class ModelClientTests(unittest.TestCase):
     def test_parses_text_and_tool_calls(self, urlopen) -> None:
         urlopen.return_value = FakeResponse(
             {
+                "usage": {
+                    "prompt_tokens": 120,
+                    "completion_tokens": 30,
+                    "total_tokens": 150,
+                    "prompt_tokens_details": {"cached_tokens": 80},
+                },
                 "choices": [
                     {
                         "message": {
@@ -55,6 +61,9 @@ class ModelClientTests(unittest.TestCase):
         reply = self.client.complete([{"role": "user", "content": "fix"}], [])
         self.assertEqual(reply.content, "Checking the file.")
         self.assertEqual(reply.tool_calls[0].name, "read_file")
+        self.assertEqual(reply.usage.input_tokens, 120)
+        self.assertEqual(reply.usage.output_tokens, 30)
+        self.assertEqual(reply.usage.cached_input_tokens, 80)
         request_object = urlopen.call_args.args[0]
         sent = json.loads(request_object.data)
         self.assertEqual(sent["model"], "test-model")
@@ -78,6 +87,12 @@ class ModelClientTests(unittest.TestCase):
         )
         urlopen.return_value = FakeResponse(
             {
+                "usage": {
+                    "input_tokens": 90,
+                    "output_tokens": 10,
+                    "total_tokens": 100,
+                    "input_tokens_details": {"cached_tokens": 40},
+                },
                 "output": [
                     {"type": "reasoning", "id": "reasoning_1", "summary": []},
                     {
@@ -145,6 +160,12 @@ class ModelClientTests(unittest.TestCase):
         )
         urlopen.return_value = FakeResponse(
             {
+                "usage": {
+                    "input_tokens": 90,
+                    "output_tokens": 10,
+                    "total_tokens": 100,
+                    "input_tokens_details": {"cached_tokens": 40},
+                },
                 "output": [
                     {
                         "type": "message",
@@ -157,6 +178,8 @@ class ModelClientTests(unittest.TestCase):
         reply = client.complete([{"role": "user", "content": "finish"}], [])
         self.assertEqual(reply.content, "Task complete.")
         self.assertEqual(reply.tool_calls, ())
+        self.assertEqual(reply.usage.total_tokens, 100)
+        self.assertEqual(reply.usage.cached_input_tokens, 40)
         self.assertEqual(urlopen.call_args.args[0].full_url, "https://example.test/v1/responses")
 
 
