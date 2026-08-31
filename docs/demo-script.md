@@ -1,70 +1,139 @@
-# 两分钟演示脚本
+# PySide6 GUI 演示与成片流程
+
+这套流程录制真实的 TinyForge 桌面操作台，不使用伪造事件或预先写好的修复结果。录制脚本
+会准备独立缺陷项目、启动 PySide6 GUI、调用真实模型完成修复，并自动回看测试、Diff、
+记忆和最终结果；渲染脚本再加入中文旁白、标题卡和总结卡。
 
 ## 录制前
 
-1. 在 `.env` 中配置可用模型，确认 `.env` 不在 Git 状态中。
-2. 终端字号调大，隐藏通知和含个人凭据的窗口。
-3. 执行 `py -3 scripts/prepare_demo.py --force` 恢复演示项目。
-4. 预先验证模型可调用、网络稳定，清空终端后再开始录制。
-
-## 0:00 - 0:15：说明目标
-
-画面显示项目根目录和终端，口述：
-
-> TinyForge 是我从零实现的命令行编程智能体，没有使用 Agent 框架。它通过模型原生
-> tool calling 自主读写本地项目、运行命令，并根据结果继续工作。
-
-## 0:15 - 0:30：展示真实缺陷
-
-运行：
+1. 在 Windows 上激活 GUI 环境并安装项目、PySide6 与渲染依赖：
 
 ```powershell
-py -3 -m unittest discover -s .demo/order_total/tests -t .demo/order_total -v
+conda activate tinyforge-gui
+python -m pip install -e ".[gui]"
+python -m pip install Pillow
 ```
 
-指向数量、舍入和负数校验三个失败，口述：
+2. 在 `.env` 中配置可用模型，确认 `.env` 被 Git 忽略。不要在终端、GUI、视频或截图中
+   打开 `.env`，也不要把 API Key 写进命令行参数。
+3. 确认录屏所需 FFmpeg 位于：
 
-> 这是一个独立的小项目，现有订单总价实现有三个真实失败，测试不会交给 Agent 修改。
+```text
+.demo/video-tools/imageio_ffmpeg/binaries/ffmpeg-win-x86_64-v7.1.exe
+```
 
-## 0:30 - 1:25：让 Agent 修复
-
-运行：
+   渲染器还使用 Windows 的 Noto Sans SC、Cascadia Mono 字体和 `Microsoft Huihui Desktop`
+   语音，正式渲染前应确认这些资源存在。
+4. 关闭通知和可能显示个人凭据的窗口，保持显示器布局和系统缩放稳定。脚本会自动选择
+   副屏并放置录制窗口，不要求手动拖动窗口。
+5. 运行主项目测试，预期为 `76/76` 通过：
 
 ```powershell
-py -3 -m tinyforge -w .demo/order_total "阅读 README 和测试，修复订单总价计算；不要修改测试，运行全部测试验证结果。"
+python -m unittest discover -s tests -v
 ```
 
-可将等待模型响应的空白片段加速，但保留以下画面：
+6. 可先执行 PySide6 离屏 smoke。正式录制前必须删除 `QT_QPA_PLATFORM`，否则系统中不会
+   出现可供 FFmpeg 捕获的窗口：
 
-- `list_files` 或 `read_file` 检查项目；
-- `edit_file` 修改 `pricing.py`；
-- `run_command` 执行测试；
-- 终端显示测试全部通过与最终回答。
+```powershell
+$env:QT_QPA_PLATFORM = "offscreen"
+python -m tinyforge.gui --smoke-test
+Remove-Item Env:QT_QPA_PLATFORM
+```
 
-口述不需要逐条念输出，只说明：
+## 录制真实 GUI
 
-> 模型只负责选择工具和生成参数，路径校验、文件修改、命令超时和结果回传都由本地
-> Runtime 执行。工具失败也会作为结构化消息返回，因此模型可以自行恢复。
+执行：
 
-## 1:25 - 1:50：展示核心实现
+```powershell
+python scripts/record_gui_demo.py --output .demo/gui-video-pyside6-final --force --timeout 600
+```
 
-快速切换到 `tinyforge/agent.py` 的 `Agent.run` 和 `tinyforge/tools.py` 的 `execute`：
+`--output` 必须位于 `.demo` 下；`--force` 会删除并重建指定输出目录。`--timeout` 是 Agent
+运行的最长秒数，超时后脚本会请求协作式停止。
 
-> 这里是核心循环：请求模型、解析 tool call、执行本地工具、把同一 tool_call_id 的结果
-> 加回历史。循环受最大轮数和重复调用保护；文件限制在工作区，危险命令默认拦截。
+脚本会自动完成以下演示流程：
 
-## 1:50 - 2:00：收尾
+1. 调用 `scripts/prepare_demo.py` 创建全新的 `workspace`。
+2. 在录制前确认演示项目共有 4 项测试，其中 3 项失败。
+3. 优先选择第一个非主显示器；没有副屏时才回退主屏。在目标屏幕可用区域中央打开标题为
+   `TinyForge 0.3.0 - Live GUI Demo`、约 `1020x640` 的普通独立 PySide6 窗口。脚本不调用
+   `raise_()` 或 `activateWindow()`，不会主动抢占用户的键盘焦点，也不要求手动拖动窗口。
+4. 自动输入任务，要求 Agent 先建立失败基线，只修改 `pricing.py`，再次运行完整测试，并
+   使用 `stage_memory` 保存带验证证据的 SOP。
+5. 在执行时间线中展示模型轮次、文件读取、精确编辑、命令输出和记忆提交。
+6. Agent 结束后依次回看最终 Result、失败测试、统一 Diff、成功测试和持久记忆。
+7. 在 GUI 关闭后独立复跑 4 项测试，并检查只改动了 `pricing.py`。
 
-画面回到测试通过结果：
+录制成功时，终端最后输出的 JSON 必须包含：
 
-> 项目还提供 50 项离线测试，其中集成测试会启动本地兼容接口，覆盖真实 CLI 的完整
-> HTTP 工具循环。完整设计和安全边界记录在仓库文档中。
+```json
+{"accepted": true, "status": "Completed", "changed_files": ["pricing.py"]}
+```
+
+录制不是按窗口标题估算画面范围：脚本通过 Win32 DWM 读取窗口的实际可见物理边界，DWM
+不可用时回退 `GetWindowRect`，再把物理桌面坐标和尺寸传给 FFmpeg `gdigrab`。因此副屏偏移、
+系统缩放和窗口边框都会计入抓取区域，`result.json` 也会记录 `capture_screen` 和
+`capture_region` 便于复核。
+
+主要录制产物位于 `.demo/gui-video-pyside6-final/`：
+
+- `gui-raw.mp4`：无旁白的真实 GUI 窗口录制；
+- `capture-reference.png`：Qt 在录制开始前保存的窗口参考图；
+- `result.json`：脱敏后的配置摘要、时间线、标记、Diff、记忆和验收数据；
+- `baseline.txt`：录制前的 4 项测试失败基线；
+- `verification.txt`：Agent 完成后的独立测试结果；
+- `ffmpeg-record.log`：窗口捕获日志；
+- `state/`：本次演示使用的隔离记忆状态。
+
+如果 `accepted` 为 `false`，不要继续渲染。先检查 `result.json` 和日志；脚本会拒绝测试证据
+不完整、改动文件不正确、记忆未提交或 FFmpeg 失败的录制。
+
+## 演示内容
+
+成片按以下顺序呈现，具体时间由录制标记自动计算：
+
+- 8 秒标题卡：说明“真实模型调用、原生桌面 GUI、完整工具时间线”；
+- GUI 主体：输入带约束的任务，观察 Agent 建立基线、读取代码、修改实现和执行验证；
+- 证据回看：展示 3 项初始失败、仅含 `pricing.py` 的 Diff、4 项测试全过；
+- 9 秒记忆卡：展示 SOP 内容及其修改、测试证据；
+- 11 秒总结卡：展示完成状态、工具统计和主项目 `76/76` 测试通过。
+
+现场讲解可集中说明：模型负责选择工具和生成参数，本地 Runtime 负责路径隔离、文件编辑、
+命令执行和结构化回传；GUI 只是同一 Runtime 的观察与操作层。持久记忆需要成功执行证据，
+失败任务不会晋升经验。
+
+## 渲染最终视频
+
+使用录制结果生成带中文旁白的 1080p 成片：
+
+```powershell
+python scripts/render_gui_demo_video.py `
+  --input .demo/gui-video-pyside6-final `
+  --output .demo/gui-video-pyside6-final/TinyForge-GUI-demo.mp4 `
+  --max-gui-seconds 92
+```
+
+`--max-gui-seconds` 是计算 GUI 主体加速比例时使用的目标上限，标题、记忆和总结卡共额外
+占用 28 秒。上面的 `92` 是严格两分钟成片示例；渲染后仍需根据 `video-manifest.json`
+检查最终时长和旁白完整性。
+
+渲染脚本会先验证 `result.json` 的完成状态、测试证据、修改范围和记忆提交，再使用 Windows
+`System.Speech` 的 `Microsoft Huihui Desktop` 生成中文旁白。它会检查最终文件包含
+`1920x1080` H.264 视频和 AAC 音频，并输出：
+
+- `.demo/gui-video-pyside6-final/TinyForge-GUI-demo.mp4`：最终成片；
+- `.demo/gui-video-pyside6-final/video-manifest.json`：时长、分辨率、帧率、加速比例和旁白时间点；
+- `.demo/gui-video-pyside6-final/render-gui/`：标题卡、记忆卡、总结卡和旁白等中间产物。
 
 ## 提交前检查
 
-- 视频为 MP4、时长不超过 2 分钟、文件不超过 200 MB；
-- 画面和声音中没有 API Key、`.env` 内容或其他凭据；
+- 主项目离线测试为 `76/76` 通过，GUI smoke 通过；
+- 录制命令退出码为 0，终端摘要中 `accepted` 为 `true`；`result.json` 中状态为
+  `Completed`，4 项演示测试最终全部通过；
+- 视频中能看清执行时间线、失败基线、`pricing.py` Diff、成功验证、Memory 和 Result；
+- 画面、声音、日志和 JSON 中没有 API Key、`.env` 内容、认证头或其他凭据；
+- 最终文件为 MP4，分辨率、音视频流、时长和文件大小符合提交平台要求；
 - 将 `README.txt` 中的占位地址替换为真实公开仓库地址；
-- 公开仓库能从全新目录克隆，按 README 命令运行；
-- ZIP 只包含最终 `README.txt` 和视频，并以本人姓名命名；
-- 截止时间后不再向公开仓库推送提交。
+- 公开仓库能从全新目录克隆，并按 README 的 `.[gui]` 安装与启动命令运行；
+- ZIP 只包含提交要求的文件并按要求命名，截止时间后不再修改公开仓库。

@@ -16,6 +16,7 @@ Chat Completions 或 Responses API，解析模型原生 tool calling，在本机
 - `edit_file`：精确局部替换，避免意外修改多处内容
 - `run_command`：在工作区执行 PowerShell 或 POSIX shell 命令
 - 单任务与连续对话两种 CLI 使用方式
+- PySide6 桌面操作台：实时执行时间线、工具详情、代码 Diff 和记忆概览
 - 工具异常结构化回传，模型可读取错误并自行修正
 - 命令超时、工作区路径隔离、危险命令拦截
 - 工具输出截断、对话上下文裁剪、最大轮数和重复调用保护
@@ -23,7 +24,7 @@ Chat Completions 或 Responses API，解析模型原生 tool calling，在本机
 - L1 索引、L2 事实、L3 SOP、L4 脱敏会话档案组成的分层持久记忆
 - `No Execution, No Memory` 证据门禁和失败任务不晋升策略
 - Chat Completions 与 Responses API 的 Token、请求数、工具数和耗时统计
-- 零运行时第三方依赖，支持 Python 3.10 及以上版本
+- 核心 Runtime 和 CLI 零第三方依赖；GUI 仅额外依赖 PySide6
 
 ## 快速开始
 
@@ -56,7 +57,8 @@ TINYFORGE_ARCHIVE_SESSIONS=true
 ```
 
 也可以使用任何支持上述协议和原生 tool calling 的兼容网关。`.env` 已经被 Git 忽略；
-环境变量优先于文件配置。命令行可通过 `--wire-api` 和 `--reasoning-effort` 临时覆盖。
+环境变量优先于文件配置。配置文件会解析到独立映射，不写入子进程继承的全局环境。
+命令行可通过 `--wire-api` 和 `--reasoning-effort` 临时覆盖。
 
 2. 直接运行单个任务：
 
@@ -76,12 +78,35 @@ py -3 -m tinyforge -w D:\path\to\project "修复失败的测试，不要修改�
 py -3 -m tinyforge
 ```
 
+启动图形界面：
+
+```powershell
+py -3 -m pip install -e ".[gui]"
+py -3 -m tinyforge.gui
+```
+
+可通过 `-w D:\path\to\project` 指定初始工作区。GUI 使用 PySide6 和 Qt Widgets，Qt 6
+默认跟随操作系统的高 DPI 与逐显示器缩放；Agent 在单独的后台线程运行，工具事件通过
+队列送回 GUI 线程，因此模型请求和命令执行不会冻结窗口。界面不会显示或保存 API Key，
+配置仍来自环境变量或未入库的 `.env`。
+
+需要保留主屏工作时，可让窗口直接在副屏居中打开，无需手动拖动：
+
+```powershell
+py -3 -m tinyforge.gui --secondary-screen
+```
+
+该模式首次显示时不抢键盘焦点、不会置顶；点击副屏窗口后仍可正常交互。没有副屏时会回退
+到系统默认显示器。
+
 交互模式支持 `/new` 清空上下文、`/memory` 查看工作记忆与 L1 索引、`/help` 查看命令、
 `/exit` 退出。也可以安装命令行入口：
 
 ```powershell
 py -3 -m pip install -e .
 tinyforge --help
+py -3 -m pip install -e ".[gui]"
+tinyforge-gui --help
 ```
 
 ## 运行流程
@@ -106,6 +131,9 @@ tinyforge --help
 - `tinyforge/memory.py`：工作检查点、分层存储、按需检索和证据门禁
 - `tinyforge/config.py`：环境变量、`.env` 和运行限制
 - `tinyforge/cli.py`：终端展示和交互会话
+- `tinyforge/runtime.py`：CLI 与 GUI 共用的运行时装配
+- `tinyforge/gui_support.py`：后台任务、事件隔离、脱敏和文件 Diff
+- `tinyforge/gui.py`：基于 PySide6 / Qt Widgets 的桌面界面
 
 更完整的设计说明和面试问答见 [`docs/design.md`](docs/design.md)，录制流程见
 [`docs/demo-script.md`](docs/demo-script.md)。论文机制、实现映射和证据边界见
@@ -151,6 +179,17 @@ py -3 -m unittest discover -s tests -v
 本地 OpenAI 兼容 HTTP 端点和真实子进程，验证请求、工具执行、结果回传及最终退出状态。
 记忆测试覆盖跨实例复用、工作区隔离、L1 上限、证据门禁、后置验证及档案脱敏。
 
+安装 GUI 可选依赖后，可在没有显示器的 CI 或远程环境中执行离屏窗口 smoke test：
+
+```powershell
+$env:QT_QPA_PLATFORM = "offscreen"
+py -3 -m tinyforge.gui --smoke-test
+Remove-Item Env:QT_QPA_PLATFORM
+```
+
+该检查只验证 Qt 应用、主窗口和核心控件能够完成构造与销毁，不会发起模型请求。实际界面
+仍应在系统缩放开启的显示器上检查一次，确认字体、分栏和按钮在目标 DPI 下完整显示。
+
 ## 两分钟演示
 
 生成一个带真实缺陷和测试的独立工作区：
@@ -172,6 +211,7 @@ py -3 -m tinyforge -w .demo/order_total "阅读 README 和测试，修复订单�
 ## 已知边界
 
 - 当前实现非流式 Chat Completions 与 Responses API，不包含流式事件解析。
+- GUI 停止操作采用协作式取消：会阻止后续步骤，但正在执行的 HTTP 请求或命令需先返回。
 - 上下文使用中英文加权估算而非厂商 tokenizer，仍可能与实际计费 Token 存在偏差。
 - 长期记忆依赖模型主动形成高质量候选，尚未实现冲突过期和自动代码化技能。
 - 危险命令检测基于规则，不能代替容器级隔离。

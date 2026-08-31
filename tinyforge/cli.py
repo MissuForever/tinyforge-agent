@@ -12,9 +12,9 @@ from typing import Any, Sequence
 from . import __version__
 from .agent import Agent, AgentEvent
 from .config import Config, ConfigError
-from .memory import MemoryRuntime, MemoryStore, redact_secrets
-from .model import ModelError, OpenAICompatibleClient
-from .tools import CompositeTools, WorkspaceTools
+from .memory import redact_secrets
+from .model import ModelError
+from .runtime import build_agent
 
 
 class Console:
@@ -153,51 +153,15 @@ def create_agent(args: argparse.Namespace, console: Console) -> Agent:
         "archive_sessions": False if args.no_session_archive else None,
     }
     config = Config.from_env(args.workspace, **overrides)
-    model = OpenAICompatibleClient(
-        api_key=config.api_key,
-        base_url=config.base_url,
-        model=config.model,
-        timeout=config.request_timeout,
-        wire_api=config.wire_api,
-        reasoning_effort=config.reasoning_effort,
-        store=config.store_responses,
-    )
-    workspace_tools = WorkspaceTools(
-        config.workspace,
-        command_timeout=config.tool_timeout,
-        max_output=config.max_tool_output,
-        allow_dangerous=config.allow_dangerous,
-    )
-    memory = None
-    if config.memory_enabled:
-        memory = MemoryRuntime(
-            MemoryStore(
-                config.state_dir,
-                config.workspace,
-                archive_sessions=config.archive_sessions,
-            )
-        )
-        tools = CompositeTools(workspace_tools, memory)
-    else:
-        tools = workspace_tools
     print(
         console.paint("TinyForge", "cyan"),
         console.paint(
             f"model={config.model} api={config.wire_api} "
-            f"memory={'on' if memory else 'off'} workspace={config.workspace}",
+            f"memory={'on' if config.memory_enabled else 'off'} workspace={config.workspace}",
             "dim",
         ),
     )
-    return Agent(
-        model=model,
-        tools=tools,
-        workspace=config.workspace,
-        max_rounds=config.max_rounds,
-        max_context_chars=config.max_context_chars,
-        max_context_tokens=config.max_context_tokens,
-        on_event=console.event,
-        memory=memory,
-    )
+    return build_agent(config, on_event=console.event)
 
 
 def interactive(agent: Agent, console: Console) -> int:

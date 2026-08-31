@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import platform
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,6 +67,7 @@ class AgentResult:
     output_tokens: int = 0
     cached_input_tokens: int = 0
     elapsed_ms: int = 0
+    cancelled: bool = False
 
 
 EventHandler = Callable[[AgentEvent], None]
@@ -136,7 +138,13 @@ class Agent:
             return "Persistent memory is disabled."
         return self.memory.anchor(0)
 
-    def run(self, task: str, *, continue_session: bool = False) -> AgentResult:
+    def run(
+        self,
+        task: str,
+        *,
+        continue_session: bool = False,
+        cancel_event: threading.Event | None = None,
+    ) -> AgentResult:
         if not task.strip():
             return AgentResult(False, "Task cannot be empty.", 0, 0)
         self._current_task = task.strip()
@@ -156,8 +164,28 @@ class Agent:
         previous_signature: tuple[tuple[str, str], ...] | None = None
         repeated_batches = 0
         completion_repair_attempted = False
+        self._emit("task_started", task=redact_secrets(self._current_task))
+
+        def cancelled_result(rounds: int) -> AgentResult:
+            answer = "Stopped at the user's request."
+            self._emit("run_cancelled", reason=answer)
+            return self._finish(
+                AgentResult(
+                    False,
+                    answer,
+                    rounds,
+                    total_tool_calls,
+                    input_tokens,
+                    output_tokens,
+                    cached_input_tokens,
+                    round((time.monotonic() - started) * 1000),
+                    True,
+                )
+            )
 
         for round_number in range(1, self.max_rounds + 1):
+            if cancel_event is not None and cancel_event.is_set():
+                return cancelled_result(round_number - 1)
             self._refresh_system_prompt(round_number)
             self.messages, removed = compact_messages(
                 self.messages,
@@ -169,11 +197,31 @@ class Agent:
                 self._emit("context_compacted", removed=removed)
 
             self._emit("model_start", round=round_number)
-            reply = self.model.complete(self.messages, self.tools.definitions)
+            if cancel_event is not None and cancel_event.is_set():
+                return cancelled_result(round_number - 1)
+            model_started = time.monotonic()
+            try:
+                reply = self.model.complete(self.messages, self.tools.definitions)
+            except Exception:
+                if cancel_event is not None and cancel_event.is_set():
+                    return cancelled_result(round_number - 1)
+                raise
             input_tokens += reply.usage.input_tokens
             output_tokens += reply.usage.output_tokens
             cached_input_tokens += reply.usage.cached_input_tokens
             self.messages.append(reply.as_message())
+            self._emit(
+                "model_end",
+                round=round_number,
+                input_tokens=reply.usage.input_tokens,
+                output_tokens=reply.usage.output_tokens,
+                cached_input_tokens=reply.usage.cached_input_tokens,
+                elapsed_ms=round((time.monotonic() - model_started) * 1000),
+            )
+
+            if cancel_event is not None and cancel_event.is_set():
+                self._append_cancelled_tool_results(reply.tool_calls)
+                return cancelled_result(round_number)
 
             if reply.content and reply.tool_calls:
                 self._emit("assistant_text", text=redact_secrets(reply.content))
@@ -239,12 +287,24 @@ class Agent:
                     )
                 )
 
-            for call in reply.tool_calls:
+            for call_index, call in enumerate(reply.tool_calls):
+                if cancel_event is not None and cancel_event.is_set():
+                    self._append_cancelled_tool_results(reply.tool_calls[call_index:])
+                    return cancelled_result(round_number)
                 total_tool_calls += 1
                 self._emit(
-                    "tool_start", name=call.name, arguments=self._safe_arguments(call.arguments)
+                    "tool_start",
+                    call_id=call.id,
+                    name=call.name,
+                    arguments=self._safe_arguments(call.arguments),
                 )
-                output = self.tools.execute(call.name, call.arguments)
+                try:
+                    output = self.tools.execute(call.name, call.arguments)
+                except Exception:
+                    if cancel_event is not None and cancel_event.is_set():
+                        self._append_cancelled_tool_results(reply.tool_calls[call_index:])
+                        return cancelled_result(round_number)
+                    raise
                 if self.memory is not None:
                     self.memory.record_tool(call.name, output)
                 self.messages.append(
@@ -254,7 +314,10 @@ class Agent:
                         "content": output,
                     }
                 )
-                self._emit("tool_end", name=call.name, output=output)
+                self._emit("tool_end", call_id=call.id, name=call.name, output=output)
+                if cancel_event is not None and cancel_event.is_set():
+                    self._append_cancelled_tool_results(reply.tool_calls[call_index + 1 :])
+                    return cancelled_result(round_number)
 
         answer = f"Stopped after reaching the maximum of {self.max_rounds} model rounds."
         self._emit("loop_stopped", reason=answer)
@@ -279,20 +342,39 @@ class Agent:
             self.messages[0] = {"role": "system", "content": content}
 
     def _finish(self, result: AgentResult) -> AgentResult:
-        if self.memory is None:
-            return result
-        try:
-            committed = self.memory.finish(
-                success=result.success,
-                task=self._current_task,
-                answer=result.answer,
-                messages=self.messages,
-            )
-            if committed:
-                self._emit("memory_committed", count=len(committed), entries=committed)
-        except (OSError, TypeError, UnicodeError, ValueError) as exc:
-            self._emit("memory_error", error=str(exc))
+        if self.memory is not None:
+            try:
+                committed = self.memory.finish(
+                    success=result.success,
+                    task=self._current_task,
+                    answer=result.answer,
+                    messages=self.messages,
+                )
+                if committed:
+                    self._emit("memory_committed", count=len(committed), entries=committed)
+            except (OSError, TypeError, UnicodeError, ValueError) as exc:
+                self._emit("memory_error", error=str(exc))
+        self._emit(
+            "task_finished",
+            success=result.success,
+            cancelled=result.cancelled,
+            rounds=result.rounds,
+            tool_calls=result.tool_calls,
+            elapsed_ms=result.elapsed_ms,
+        )
         return result
+
+    def _append_cancelled_tool_results(self, calls: tuple[Any, ...]) -> None:
+        for call in calls:
+            self.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": json.dumps(
+                        {"ok": False, "cancelled": True, "error": "Cancelled by user."}
+                    ),
+                }
+            )
 
     def _emit(self, kind: str, **data: Any) -> None:
         self.on_event(AgentEvent(kind=kind, data=data))

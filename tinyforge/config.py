@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -11,11 +12,12 @@ class ConfigError(ValueError):
     """Raised when required configuration is missing or invalid."""
 
 
-def load_env_file(path: Path) -> None:
-    """Load a minimal KEY=VALUE env file without overriding real environment values."""
+def read_env_file(path: Path) -> dict[str, str]:
+    """Parse a minimal KEY=VALUE file without changing the process environment."""
     if not path.is_file():
-        return
+        return {}
 
+    values: dict[str, str] = {}
     for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -28,11 +30,20 @@ def load_env_file(path: Path) -> None:
         if value and value[0] == value[-1] and value[0] in {"'", '"'}:
             value = value[1:-1]
         if key:
-            os.environ.setdefault(key, value)
+            values.setdefault(key, value)
+    return values
 
 
-def _env_int(name: str, default: int, minimum: int) -> int:
-    value = os.getenv(name)
+def load_env_file(path: Path) -> None:
+    """Load a parsed env file without overriding existing process values."""
+    for key, value in read_env_file(path).items():
+        os.environ.setdefault(key, value)
+
+
+def _env_int(
+    environment: Mapping[str, str], name: str, default: int, minimum: int
+) -> int:
+    value = environment.get(name)
     if value is None:
         return default
     try:
@@ -44,8 +55,8 @@ def _env_int(name: str, default: int, minimum: int) -> int:
     return parsed
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    value = os.getenv(name)
+def _env_bool(environment: Mapping[str, str], name: str, default: bool) -> bool:
+    value = environment.get(name)
     if value is None:
         return default
     normalized = value.strip().lower()
@@ -87,22 +98,29 @@ class Config:
     def from_env(cls, workspace: str | Path = ".", **overrides: object) -> "Config":
         root = Path(workspace).expanduser().resolve()
         launch_directory = Path.cwd().resolve()
-        load_env_file(launch_directory / ".env")
+        file_environment = read_env_file(launch_directory / ".env")
         if root != launch_directory:
-            load_env_file(root / ".env")
+            for key, value in read_env_file(root / ".env").items():
+                file_environment.setdefault(key, value)
+        environment = dict(file_environment)
+        environment.update(os.environ)
 
-        api_key = os.getenv("TINYFORGE_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+        api_key = environment.get("TINYFORGE_API_KEY") or environment.get("OPENAI_API_KEY") or ""
         base_url = (
-            os.getenv("TINYFORGE_BASE_URL")
-            or os.getenv("OPENAI_BASE_URL")
+            environment.get("TINYFORGE_BASE_URL")
+            or environment.get("OPENAI_BASE_URL")
             or "https://api.openai.com/v1"
         )
-        model = os.getenv("TINYFORGE_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
-        wire_api = os.getenv("TINYFORGE_WIRE_API", "chat_completions").strip().lower()
+        model = (
+            environment.get("TINYFORGE_MODEL")
+            or environment.get("OPENAI_MODEL")
+            or "gpt-4o-mini"
+        )
+        wire_api = environment.get("TINYFORGE_WIRE_API", "chat_completions").strip().lower()
         if wire_api == "chat":
             wire_api = "chat_completions"
         state_dir = Path(
-            os.getenv("TINYFORGE_STATE_DIR") or _default_state_dir()
+            environment.get("TINYFORGE_STATE_DIR") or _default_state_dir()
         ).expanduser().resolve()
 
         config = cls(
@@ -112,16 +130,22 @@ class Config:
             workspace=root,
             state_dir=state_dir,
             wire_api=wire_api,
-            reasoning_effort=os.getenv("TINYFORGE_REASONING_EFFORT") or None,
-            store_responses=_env_bool("TINYFORGE_STORE_RESPONSES", False),
-            max_rounds=_env_int("TINYFORGE_MAX_ROUNDS", 30, 1),
-            tool_timeout=_env_int("TINYFORGE_TOOL_TIMEOUT", 60, 1),
-            request_timeout=_env_int("TINYFORGE_REQUEST_TIMEOUT", 120, 1),
-            max_tool_output=_env_int("TINYFORGE_MAX_TOOL_OUTPUT", 30_000, 1_000),
-            max_context_chars=_env_int("TINYFORGE_MAX_CONTEXT_CHARS", 150_000, 10_000),
-            max_context_tokens=_env_int("TINYFORGE_MAX_CONTEXT_TOKENS", 30_000, 2_000),
-            memory_enabled=_env_bool("TINYFORGE_MEMORY_ENABLED", True),
-            archive_sessions=_env_bool("TINYFORGE_ARCHIVE_SESSIONS", True),
+            reasoning_effort=environment.get("TINYFORGE_REASONING_EFFORT") or None,
+            store_responses=_env_bool(environment, "TINYFORGE_STORE_RESPONSES", False),
+            max_rounds=_env_int(environment, "TINYFORGE_MAX_ROUNDS", 30, 1),
+            tool_timeout=_env_int(environment, "TINYFORGE_TOOL_TIMEOUT", 60, 1),
+            request_timeout=_env_int(environment, "TINYFORGE_REQUEST_TIMEOUT", 120, 1),
+            max_tool_output=_env_int(
+                environment, "TINYFORGE_MAX_TOOL_OUTPUT", 30_000, 1_000
+            ),
+            max_context_chars=_env_int(
+                environment, "TINYFORGE_MAX_CONTEXT_CHARS", 150_000, 10_000
+            ),
+            max_context_tokens=_env_int(
+                environment, "TINYFORGE_MAX_CONTEXT_TOKENS", 30_000, 2_000
+            ),
+            memory_enabled=_env_bool(environment, "TINYFORGE_MEMORY_ENABLED", True),
+            archive_sessions=_env_bool(environment, "TINYFORGE_ARCHIVE_SESSIONS", True),
         )
         known_overrides = {key: value for key, value in overrides.items() if value is not None}
         if known_overrides:

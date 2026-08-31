@@ -12,8 +12,12 @@ license = {text = "MIT"}
 authors = [{name = "Student"}]
 dependencies = []
 
+[project.optional-dependencies]
+gui = ["PySide6>=6.7,<7"]
+
 [project.scripts]
 tinyforge = "tinyforge.cli:main"
+tinyforge-gui = "tinyforge.gui:main"
 
 [tool.setuptools.packages.find]
 include = ["tinyforge*"]

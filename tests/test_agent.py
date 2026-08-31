@@ -5,6 +5,7 @@ import os
 import shlex
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -362,6 +363,120 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(success)
         self.assertNotIn(secret, answer)
         self.assertIn("REDACTED", answer)
+
+    def test_cancel_before_first_round_does_not_call_model(self) -> None:
+        cancel_event = threading.Event()
+        cancel_event.set()
+        model = ScriptedModel([])
+        events: list[AgentEvent] = []
+        with tempfile.TemporaryDirectory() as temp:
+            result = Agent(
+                model=model,
+                tools=WorkspaceTools(Path(temp)),
+                workspace=Path(temp),
+                on_event=events.append,
+            ).run("Do not start", cancel_event=cancel_event)
+
+        self.assertTrue(result.cancelled)
+        self.assertFalse(result.success)
+        self.assertEqual(result.rounds, 0)
+        self.assertEqual(model.calls, [])
+        self.assertIn("run_cancelled", [event.kind for event in events])
+        self.assertIn("task_finished", [event.kind for event in events])
+
+    def test_model_error_after_cancel_finishes_as_cancelled(self) -> None:
+        cancel_event = threading.Event()
+        events: list[AgentEvent] = []
+
+        class CancellingModel:
+            def complete(self, messages, tools):
+                cancel_event.set()
+                raise RuntimeError("request interrupted")
+
+        with tempfile.TemporaryDirectory() as temp:
+            result = Agent(
+                model=CancellingModel(),
+                tools=WorkspaceTools(Path(temp)),
+                workspace=Path(temp),
+                on_event=events.append,
+            ).run("Stop during the request", cancel_event=cancel_event)
+
+        self.assertTrue(result.cancelled)
+        self.assertFalse(result.success)
+        self.assertEqual(result.rounds, 0)
+        self.assertIn("run_cancelled", [event.kind for event in events])
+        self.assertIn("task_finished", [event.kind for event in events])
+
+    def test_tool_error_after_cancel_completes_all_tool_results(self) -> None:
+        cancel_event = threading.Event()
+        events: list[AgentEvent] = []
+        model = ScriptedModel(
+            [
+                AssistantReply(
+                    "",
+                    (
+                        ToolCall("first", "failing_tool", "{}"),
+                        ToolCall("second", "failing_tool", "{}"),
+                    ),
+                )
+            ]
+        )
+
+        class CancellingTools:
+            definitions: list[dict[str, object]] = []
+
+            def execute(self, name, arguments):
+                cancel_event.set()
+                raise RuntimeError("tool interrupted")
+
+        with tempfile.TemporaryDirectory() as temp:
+            agent = Agent(
+                model=model,
+                tools=CancellingTools(),
+                workspace=Path(temp),
+                on_event=events.append,
+            )
+            result = agent.run("Stop during a tool", cancel_event=cancel_event)
+
+        self.assertTrue(result.cancelled)
+        self.assertEqual(result.tool_calls, 1)
+        tool_messages = [message for message in agent.messages if message["role"] == "tool"]
+        self.assertEqual([message["tool_call_id"] for message in tool_messages], ["first", "second"])
+        self.assertTrue(all(json.loads(message["content"])["cancelled"] for message in tool_messages))
+        self.assertIn("task_finished", [event.kind for event in events])
+
+    def test_cancel_between_tools_skips_remaining_calls(self) -> None:
+        cancel_event = threading.Event()
+        model = ScriptedModel(
+            [
+                AssistantReply(
+                    "",
+                    (
+                        ToolCall("first", "list_files", '{"path":"."}'),
+                        ToolCall("second", "list_files", '{"path":"."}'),
+                    ),
+                )
+            ]
+        )
+
+        def on_event(event: AgentEvent) -> None:
+            if event.kind == "tool_end" and event.data.get("call_id") == "first":
+                cancel_event.set()
+
+        with tempfile.TemporaryDirectory() as temp:
+            agent = Agent(
+                model=model,
+                tools=WorkspaceTools(Path(temp)),
+                workspace=Path(temp),
+                on_event=on_event,
+            )
+            result = agent.run("List once", cancel_event=cancel_event)
+
+        self.assertTrue(result.cancelled)
+        self.assertEqual(result.tool_calls, 1)
+        tool_messages = [message for message in agent.messages if message["role"] == "tool"]
+        self.assertEqual([message["tool_call_id"] for message in tool_messages], ["first", "second"])
+        self.assertTrue(json.loads(tool_messages[1]["content"])["cancelled"])
 
 
 if __name__ == "__main__":

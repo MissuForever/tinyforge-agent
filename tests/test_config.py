@@ -22,10 +22,40 @@ class ConfigTests(unittest.TestCase):
     def test_missing_api_key_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             with patch.dict(os.environ, {}, clear=True), patch(
-                "tinyforge.config.load_env_file"
+                "tinyforge.config.read_env_file", return_value={}
             ):
                 with self.assertRaises(ConfigError):
                     Config.from_env(temp)
+
+    def test_workspace_env_files_do_not_pollute_each_other_or_process(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            launch = root / "launcher"
+            first = root / "first"
+            second = root / "second"
+            launch.mkdir()
+            first.mkdir()
+            second.mkdir()
+            (first / ".env").write_text(
+                "TINYFORGE_API_KEY=first-key\nTINYFORGE_MODEL=first-model\n",
+                encoding="utf-8",
+            )
+            (second / ".env").write_text(
+                "TINYFORGE_API_KEY=second-key\nTINYFORGE_MODEL=second-model\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {}, clear=True), patch(
+                "tinyforge.config.Path.cwd", return_value=launch
+            ):
+                first_config = Config.from_env(first)
+                second_config = Config.from_env(second)
+                self.assertNotIn("TINYFORGE_API_KEY", os.environ)
+                self.assertNotIn("TINYFORGE_MODEL", os.environ)
+
+            self.assertEqual(first_config.api_key, "first-key")
+            self.assertEqual(first_config.model, "first-model")
+            self.assertEqual(second_config.api_key, "second-key")
+            self.assertEqual(second_config.model, "second-model")
 
     def test_environment_and_overrides_are_combined(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
