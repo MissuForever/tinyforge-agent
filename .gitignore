@@ -12,5 +12,6 @@ venv/
 .tinyforge-state/
 .demo/
 Agent论文/
+/推免考核题目学生版.md
 .idea/
 .vscode/
