@@ -1,6 +1,6 @@
 TinyForge 编程智能体
 
-Git 仓库：[提交前填写公开 GitHub 或 Gitee 仓库地址]
+Git 仓库：https://github.com/MissuForever/tinyforge-agent
 
 运行环境：Python 3.10 及以上。复制 .env.example 为 .env，填写 TINYFORGE_API_KEY、TINYFORGE_BASE_URL 和 TINYFORGE_MODEL，然后执行：
 py -3 -m tinyforge "你的编程任务"
