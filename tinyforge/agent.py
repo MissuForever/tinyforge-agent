@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import platform
 import threading
@@ -71,6 +72,21 @@ class AgentResult:
 
 
 EventHandler = Callable[[AgentEvent], None]
+
+
+def _accepts_cancel_event(callback: Callable[..., Any]) -> bool:
+    try:
+        parameters = inspect.signature(callback).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        or (
+            parameter.name == "cancel_event"
+            and parameter.kind is not inspect.Parameter.POSITIONAL_ONLY
+        )
+        for parameter in parameters
+    )
 
 
 def build_system_prompt(workspace: Path, *, memory_enabled: bool = False) -> str:
@@ -299,7 +315,30 @@ class Agent:
                     arguments=self._safe_arguments(call.arguments),
                 )
                 try:
-                    output = self.tools.execute(call.name, call.arguments)
+                    execute_with_progress = getattr(self.tools, "execute_with_progress", None)
+                    if callable(execute_with_progress):
+                        progress_handler = (
+                            lambda stream, text, call_id=call.id, name=call.name: self._emit(
+                                "tool_output", call_id=call_id, name=name, stream=stream, text=text
+                            )
+                        )
+                        if cancel_event is not None and _accepts_cancel_event(
+                            execute_with_progress
+                        ):
+                            output = execute_with_progress(
+                                call.name,
+                                call.arguments,
+                                progress_handler,
+                                cancel_event=cancel_event,
+                            )
+                        else:
+                            output = execute_with_progress(
+                                call.name,
+                                call.arguments,
+                                progress_handler,
+                            )
+                    else:
+                        output = self.tools.execute(call.name, call.arguments)
                 except Exception:
                     if cancel_event is not None and cancel_event.is_set():
                         self._append_cancelled_tool_results(reply.tool_calls[call_index:])

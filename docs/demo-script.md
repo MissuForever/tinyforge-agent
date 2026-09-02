@@ -10,8 +10,7 @@
 
 ```powershell
 conda activate tinyforge-gui
-python -m pip install -e ".[gui]"
-python -m pip install Pillow
+python -m pip install -e ".[demo]"
 ```
 
 2. 在 `.env` 中配置可用模型，确认 `.env` 被 Git 忽略。不要在终端、GUI、视频或截图中
@@ -22,11 +21,12 @@ python -m pip install Pillow
 .demo/video-tools/imageio_ffmpeg/binaries/ffmpeg-win-x86_64-v7.1.exe
 ```
 
-   渲染器还使用 Windows 的 Noto Sans SC、Cascadia Mono 字体和 `Microsoft Huihui Desktop`
-   语音，正式渲染前应确认这些资源存在。
+   渲染器还使用 Windows 的 Noto Sans SC 和 Cascadia Mono 字体。旁白默认使用联网的
+   `zh-CN-XiaoxiaoNeural` 神经语音；断网时 `auto` 模式会整批回退到本地已安装的
+   `Microsoft Huihui Desktop`，不会在同一视频中混用音色。
 4. 关闭通知和可能显示个人凭据的窗口，保持显示器布局和系统缩放稳定。脚本会自动选择
    副屏并放置录制窗口，不要求手动拖动窗口。
-5. 运行主项目测试，预期为 `76/76` 通过：
+5. 运行主项目测试，预期全部通过：
 
 ```powershell
 python -m unittest discover -s tests -v
@@ -97,7 +97,7 @@ python scripts/record_gui_demo.py --output .demo/gui-video-pyside6-final --force
 - GUI 主体：输入带约束的任务，观察 Agent 建立基线、读取代码、修改实现和执行验证；
 - 证据回看：展示 3 项初始失败、仅含 `pricing.py` 的 Diff、4 项测试全过；
 - 9 秒记忆卡：展示 SOP 内容及其修改、测试证据；
-- 11 秒总结卡：展示完成状态、工具统计和主项目 `76/76` 测试通过。
+- 11 秒总结卡：展示完成状态、工具统计和主项目完整测试通过。
 
 现场讲解可集中说明：模型负责选择工具和生成参数，本地 Runtime 负责路径隔离、文件编辑、
 命令执行和结构化回传；GUI 只是同一 Runtime 的观察与操作层。持久记忆需要成功执行证据，
@@ -111,24 +111,31 @@ python scripts/record_gui_demo.py --output .demo/gui-video-pyside6-final --force
 python scripts/render_gui_demo_video.py `
   --input .demo/gui-video-pyside6-final `
   --output .demo/gui-video-pyside6-final/TinyForge-GUI-demo.mp4 `
-  --max-gui-seconds 92
+  --max-gui-seconds 92 `
+  --tts-backend edge `
+  --edge-voice zh-CN-XiaoxiaoNeural `
+  --edge-rate=+5%
 ```
 
 `--max-gui-seconds` 是计算 GUI 主体加速比例时使用的目标上限，标题、记忆和总结卡共额外
 占用 28 秒。上面的 `92` 是严格两分钟成片示例；渲染后仍需根据 `video-manifest.json`
 检查最终时长和旁白完整性。
 
-渲染脚本会先验证 `result.json` 的完成状态、测试证据、修改范围和记忆提交，再使用 Windows
-`System.Speech` 的 `Microsoft Huihui Desktop` 生成中文旁白。它会检查最终文件包含
-`1920x1080` H.264 视频和 AAC 音频，并输出：
+渲染脚本会先验证 `result.json` 的完成状态、测试证据、修改范围和记忆提交，再联网生成自然
+中文旁白并统一转换为 `24 kHz` 单声道 PCM。`--tts-backend edge` 在网络失败时会明确报错；
+使用默认的 `auto` 会改为整批本地旁白。受限网络可增加 `--tts-proxy http://host:port`；需要
+强制直连时使用 `--no-tts-proxy`。代理参数不要包含会写入命令历史的明文凭据。最终 MP4
+内嵌 AAC 音轨，播放时不需要联网或安装 TTS。
+脚本会检查最终文件包含 `1920x1080` H.264 视频和 AAC 音频，并输出：
 
 - `.demo/gui-video-pyside6-final/TinyForge-GUI-demo.mp4`：最终成片；
-- `.demo/gui-video-pyside6-final/video-manifest.json`：时长、分辨率、帧率、加速比例和旁白时间点；
+- `.demo/gui-video-pyside6-final/video-manifest.json`：时长、分辨率、帧率、加速比例、旁白时间点，
+  以及请求/实际 TTS 后端、音色、语速、采样率和回退状态；
 - `.demo/gui-video-pyside6-final/render-gui/`：标题卡、记忆卡、总结卡和旁白等中间产物。
 
 ## 提交前检查
 
-- 主项目离线测试为 `76/76` 通过，GUI smoke 通过；
+- 主项目离线测试全部通过，GUI smoke 通过；
 - 录制命令退出码为 0，终端摘要中 `accepted` 为 `true`；`result.json` 中状态为
   `Completed`，4 项演示测试最终全部通过；
 - 视频中能看清执行时间线、失败基线、`pricing.py` Diff、成功验证、Memory 和 Result；

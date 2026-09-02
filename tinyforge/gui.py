@@ -6,7 +6,9 @@ import argparse
 import json
 import os
 import queue
+import re
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -20,6 +22,7 @@ from PySide6.QtGui import (
     QShortcut,
     QSyntaxHighlighter,
     QTextCharFormat,
+    QTextCursor,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -115,11 +118,65 @@ class MemoryHighlighter(QSyntaxHighlighter):
                 self.setFormat(0, key + 1, self.heading)
 
 
+class TerminalHighlighter(QSyntaxHighlighter):
+    """Keep commands, stderr, and exit states scannable in the terminal log."""
+
+    def __init__(self, document: Any) -> None:
+        super().__init__(document)
+        self.prompt = self._format("#79d9c0", bold=True)
+        self.stdout = self._format("#d6dfdc")
+        self.stderr = self._format("#ff9da4")
+        self.success = self._format("#7fd6a5", bold=True)
+        self.error = self._format("#ff9da4", bold=True)
+        self.muted = self._format("#8c999e")
+
+    @staticmethod
+    def _format(color: str, *, bold: bool = False) -> QTextCharFormat:
+        value = QTextCharFormat()
+        value.setForeground(QColor(color))
+        value.setFontWeight(QFont.Weight.DemiBold if bold else QFont.Weight.Normal)
+        return value
+
+    def highlightBlock(self, text: str) -> None:  # noqa: N802 - Qt API
+        if text.startswith(("[command]", "PS ", "$ ")):
+            selected = self.prompt
+        elif text.startswith("[stdout]"):
+            selected = self.stdout
+        elif text.startswith("[stderr]"):
+            selected = self.stderr
+        elif text.startswith("[exit 0]"):
+            selected = self.success
+        elif text.startswith(("[exit ", "[error]", "[interrupted]", "[stopped]")):
+            selected = self.error
+        elif text.startswith("[earlier output omitted]"):
+            selected = self.muted
+        else:
+            return
+        self.setFormat(0, len(text), selected)
+
+
+@dataclass(slots=True)
+class _TerminalCommandState:
+    streamed: set[str] = field(default_factory=set)
+    line_start: bool = True
+    active_source: str | None = None
+    pending: dict[str, str] = field(
+        default_factory=lambda: {"stdout": "", "stderr": ""}
+    )
+    discarding: set[str] = field(default_factory=set)
+
+
 class TinyForgeApp(QMainWindow):
     """A focused, auditable desktop workbench for the TinyForge runtime."""
 
     MAX_TIMELINE_ITEMS = 500
     MAX_CHANGES_CHARS = 200_000
+    MAX_TERMINAL_CHARS = 200_000
+    TERMINAL_TRIM_CHARS = 160_000
+    MAX_TERMINAL_CHUNK_CHARS = 40_000
+    ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+    CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+    BIDI_CONTROL_RE = re.compile(r"[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 
     COLORS = {
         "canvas": "#f4f6f7",
@@ -186,6 +243,10 @@ class TinyForgeApp(QMainWindow):
         self._change_count = 0
         self._memory_commit_count = 0
         self._item_sequence = 0
+        self._terminal_commands: dict[str, _TerminalCommandState] = {}
+        self._terminal_command_count = 0
+        self._terminal_auto_opened = False
+        self._terminal_workspace = initial_workspace
 
         self.event_queue: queue.Queue[UiEnvelope] = queue.Queue(maxsize=2_000)
         self.worker = AgentWorker(self.event_queue)
@@ -292,6 +353,11 @@ class TinyForgeApp(QMainWindow):
             QPlainTextEdit#CodeText {{
                 border: 0; border-radius: 0; font-family: "Cascadia Mono", Consolas;
                 font-size: 9.5pt; color: #263238;
+            }}
+            QPlainTextEdit#TerminalText {{
+                background: #111517; color: #d6dfdc; border: 0; border-radius: 0;
+                font-family: "Cascadia Mono", Consolas; font-size: 9.5pt;
+                selection-background-color: #315c66; selection-color: #ffffff;
             }}
             QFrame#Composer {{ background: {self.COLORS['panel']}; border-top: 1px solid {self.COLORS['border']}; }}
             QLabel#ShortcutHint {{ color: #7a858b; font-size: 8.5pt; }}
@@ -494,11 +560,16 @@ class TinyForgeApp(QMainWindow):
         self.details_text = self._make_inspector_text(code=False, wrap=True)
         self.changes_text = self._make_inspector_text(code=True, wrap=False)
         self.memory_text = self._make_inspector_text(code=True, wrap=True)
+        self.terminal_text = self._make_inspector_text(code=True, wrap=False)
+        self.terminal_text.setObjectName("TerminalText")
+        self.terminal_text.setUndoRedoEnabled(False)
         self._diff_highlighter = DiffHighlighter(self.changes_text.document())
         self._memory_highlighter = MemoryHighlighter(self.memory_text.document())
+        self._terminal_highlighter = TerminalHighlighter(self.terminal_text.document())
         self.inspector.addTab(self.details_text, "Details")
         self.inspector.addTab(self.changes_text, "Changes")
         self.inspector.addTab(self.memory_text, "Memory")
+        self.inspector.addTab(self.terminal_text, "Terminal")
         layout.addWidget(self.inspector)
         return panel
 
@@ -568,11 +639,18 @@ class TinyForgeApp(QMainWindow):
         self._settings_dirty = True
 
     def _refresh_workspace_defaults(self) -> None:
-        if self.worker.is_running or self._settings_dirty:
+        if self.worker.is_running:
             return
         try:
             workspace = Path(self.workspace_entry.text()).expanduser().resolve()
         except (OSError, ValueError):
+            return
+        if workspace != self._terminal_workspace:
+            self.workspace_entry.setToolTip(str(workspace))
+            self._has_session = False
+            self._set_memory_text("Memory has not been loaded for this workspace.")
+            self._reset_terminal(workspace)
+        if self._settings_dirty:
             return
         if workspace == self._settings_workspace:
             return
@@ -598,6 +676,7 @@ class TinyForgeApp(QMainWindow):
                 self._apply_workspace_defaults(workspace, preview_config)
             self._has_session = False
             self._set_memory_text("Memory has not been loaded for this workspace.")
+            self._reset_terminal(workspace)
 
     def _new_session(self) -> None:
         if not self.worker.reset():
@@ -615,8 +694,13 @@ class TinyForgeApp(QMainWindow):
         self._memory_commit_count = 0
         self.timeline.clear()
         self.timeline_count_label.setText("0 events")
-        self.inspector.setTabText(1, "Changes")
-        self.inspector.setTabText(2, "Memory")
+        self.inspector.setTabText(self.inspector.indexOf(self.changes_text), "Changes")
+        self.inspector.setTabText(self.inspector.indexOf(self.memory_text), "Memory")
+        try:
+            terminal_workspace = Path(self.workspace_entry.text()).expanduser().resolve()
+        except (OSError, ValueError):
+            terminal_workspace = self._terminal_workspace
+        self._reset_terminal(terminal_workspace)
         self._set_details_text("Select an execution step to inspect its evidence.")
         self._set_changes_text("No file changes captured.")
         self._refresh_memory()
@@ -670,6 +754,8 @@ class TinyForgeApp(QMainWindow):
             self._set_status("Already running", "warning")
             return
         self.current_run_id = run_id
+        if workspace != self._terminal_workspace:
+            self._reset_terminal(workspace)
         self.model_entry.setText(config.model)
         self.protocol_combo.setCurrentText(config.wire_api)
         safe_task = redact_secrets(task)
@@ -796,15 +882,34 @@ class TinyForgeApp(QMainWindow):
             )
             self._tool_items[call_id] = item
             self._active_items.add(item)
+            if name == "run_command":
+                self._start_terminal_command(call_id, arguments)
+        elif event.kind == "tool_output":
+            call_id = str(data.get("call_id", ""))
+            name = str(data.get("name", ""))
+            stream = str(data.get("stream", ""))
+            text = str(data.get("text", ""))
+            if name == "run_command":
+                self._append_terminal_output(call_id, stream, text)
         elif event.kind == "tool_end":
             call_id = str(data.get("call_id", ""))
             name = str(data.get("name", "tool"))
             output = str(data.get("output", ""))
+            terminal_result = data.get("terminal_result")
+            cancelled = (
+                name == "run_command"
+                and isinstance(terminal_result, dict)
+                and terminal_result.get("cancelled") is True
+            )
             if isinstance(data.get("output_ok"), bool):
                 ok = bool(data["output_ok"])
                 summary = str(data.get("output_summary", "Completed"))
             else:
                 ok, summary = summarize_tool_output(output)
+            state = "Stopped" if cancelled else ("Succeeded" if ok else "Failed")
+            tone = "warning" if cancelled else ("success" if ok else "error")
+            if cancelled:
+                summary = "Cancelled by user"
             item = self._tool_items.get(call_id)
             details = output
             if item:
@@ -813,20 +918,22 @@ class TinyForgeApp(QMainWindow):
                 details = f"Arguments\n{prior}\n\nResult\n{output}"
                 self._update_timeline(
                     item,
-                    "Succeeded" if ok else "Failed",
+                    state,
                     name,
                     summary,
                     details,
-                    "success" if ok else "error",
+                    tone,
                 )
             else:
                 self._insert_timeline(
-                    "Succeeded" if ok else "Failed",
+                    state,
                     name,
                     summary,
                     details,
-                    "success" if ok else "error",
+                    tone,
                 )
+            if name == "run_command":
+                self._finish_terminal_command(call_id, data)
         elif event.kind == "context_compacted":
             removed = int(data.get("removed", 0))
             self._insert_timeline(
@@ -843,7 +950,10 @@ class TinyForgeApp(QMainWindow):
         elif event.kind == "memory_committed":
             count = int(data.get("count", 0))
             self._memory_commit_count += count
-            self.inspector.setTabText(2, f"Memory ({self._memory_commit_count})")
+            self.inspector.setTabText(
+                self.inspector.indexOf(self.memory_text),
+                f"Memory ({self._memory_commit_count})",
+            )
             self._insert_timeline(
                 "Saved",
                 "Memory",
@@ -878,6 +988,7 @@ class TinyForgeApp(QMainWindow):
             "Stopped" if result.cancelled else "Failed",
             "warning" if result.cancelled else "error",
         )
+        self._settle_terminal_commands("stopped" if result.cancelled else "interrupted")
         self._finalize_task_item(state, tag, details)
         self._insert_timeline(state, "Result", self._one_line(result.answer), details, tag)
         self._set_status(state, tone)
@@ -890,6 +1001,7 @@ class TinyForgeApp(QMainWindow):
     def _finish_error(self, error: str) -> None:
         safe_error = error.strip() or "The Agent stopped with an unknown error."
         self._settle_active_items("Failed", "error")
+        self._settle_terminal_commands("interrupted")
         self._finalize_task_item("Error", "error", safe_error)
         self._insert_timeline("Error", "Runtime", self._one_line(safe_error), safe_error, "error")
         self._set_status("Runtime error", "error")
@@ -991,7 +1103,207 @@ class TinyForgeApp(QMainWindow):
             combined = "[Earlier changes omitted]\n\n" + combined[-self.MAX_CHANGES_CHARS :]
         self._set_changes_text(combined)
         self._change_count += 1
-        self.inspector.setTabText(1, f"Changes ({self._change_count})")
+        self.inspector.setTabText(
+            self.inspector.indexOf(self.changes_text), f"Changes ({self._change_count})"
+        )
+
+    def _reset_terminal(self, workspace: Path) -> None:
+        self.terminal_text.clear()
+        self._terminal_commands.clear()
+        self._terminal_command_count = 0
+        self._terminal_auto_opened = False
+        self._terminal_workspace = workspace
+        self.inspector.setTabText(self.inspector.indexOf(self.terminal_text), "Terminal")
+
+    def _start_terminal_command(self, call_id: str, arguments: object) -> None:
+        if not call_id or not isinstance(arguments, dict):
+            return
+        command = str(arguments.get("command", "")).strip()
+        if not command:
+            return
+        if call_id in self._terminal_commands:
+            self._append_terminal("[interrupted] duplicate command identifier\n\n")
+        cwd = str(arguments.get("cwd", ".") or ".")
+        if self.terminal_text.document().characterCount() > 1:
+            self._append_terminal("\n")
+        prompt = f"PS {cwd}> " if os.name == "nt" else f"$ {cwd}> "
+        rendered, _ = self._format_terminal_lines("command", f"{prompt}{command}\n", True)
+        self._append_terminal(rendered)
+        self._terminal_commands[call_id] = _TerminalCommandState()
+        self._terminal_command_count += 1
+        self.inspector.setTabText(
+            self.inspector.indexOf(self.terminal_text),
+            f"Terminal ({self._terminal_command_count})",
+        )
+        if not self._terminal_auto_opened:
+            self.inspector.setCurrentWidget(self.terminal_text)
+            self._terminal_auto_opened = True
+
+    def _append_terminal_output(self, call_id: str, stream: str, text: str) -> None:
+        state = self._terminal_commands.get(call_id)
+        if state is None or stream not in {"stdout", "stderr"}:
+            return
+        if not text:
+            return
+        if stream in state.discarding:
+            newline = text.find("\n")
+            if newline < 0:
+                return
+            state.discarding.discard(stream)
+            text = text[newline + 1 :]
+        buffered = state.pending[stream] + text
+        state.pending[stream] = ""
+        while buffered:
+            newline = buffered.find("\n")
+            if newline < 0:
+                if len(buffered) > self.MAX_TERMINAL_CHUNK_CHARS:
+                    self._render_terminal_output_piece(
+                        state,
+                        stream,
+                        "[output line omitted: exceeds display limit]\n",
+                    )
+                    state.discarding.add(stream)
+                else:
+                    state.pending[stream] = buffered
+                return
+            line = buffered[: newline + 1]
+            buffered = buffered[newline + 1 :]
+            if len(line) > self.MAX_TERMINAL_CHUNK_CHARS:
+                line = "[output line omitted: exceeds display limit]\n"
+            self._render_terminal_output_piece(state, stream, line)
+
+    def _render_terminal_output_piece(
+        self, state: _TerminalCommandState, stream: str, text: str
+    ) -> None:
+        switched_mid_line = not state.line_start and state.active_source != stream
+        rendered, line_start = self._format_terminal_lines(
+            stream, text, True if switched_mid_line else state.line_start
+        )
+        if not rendered:
+            return
+        if switched_mid_line:
+            rendered = "\n" + rendered
+        state.streamed.add(stream)
+        state.line_start = line_start
+        state.active_source = None if line_start else stream
+        self._append_terminal(rendered)
+
+    def _finish_terminal_command(self, call_id: str, data: dict[str, Any]) -> None:
+        state = self._terminal_commands.get(call_id)
+        if state is None:
+            return
+        self._flush_terminal_output(state)
+        self._terminal_commands.pop(call_id, None)
+        result = data.get("terminal_result")
+        if isinstance(result, dict):
+            stdout = str(result.get("stdout", ""))
+            stderr = str(result.get("stderr", ""))
+            if stdout and "stdout" not in state.streamed:
+                self._append_terminal_output_fallback("stdout", stdout)
+            if stderr and "stderr" not in state.streamed:
+                self._append_terminal_output_fallback("stderr", stderr)
+            if result.get("truncated") and not state.streamed and not stdout and not stderr:
+                self._append_terminal("[earlier output omitted]\n")
+        current = self.terminal_text.toPlainText()
+        if current and not current.endswith("\n"):
+            self._append_terminal("\n")
+        if isinstance(result, dict) and result.get("parsed") and result.get("cancelled"):
+            self._append_terminal("[stopped]\n\n")
+        elif isinstance(result, dict) and result.get("parsed") and result.get("ok"):
+            exit_code = result.get("exit_code")
+            label = str(exit_code) if type(exit_code) is int else "unknown"
+            self._append_terminal(f"[exit {label}]\n\n")
+        else:
+            error = (
+                str(result.get("error", "Command result unavailable"))
+                if isinstance(result, dict)
+                else "Command result unavailable"
+            )
+            rendered, _ = self._format_terminal_lines("error", error, True)
+            if not rendered:
+                rendered = "[error] Command failed"
+            self._append_terminal(rendered.rstrip("\n") + "\n\n")
+
+    def _append_terminal_output_fallback(self, stream: str, text: str) -> None:
+        rendered, _ = self._format_terminal_lines(stream, text, True)
+        current = self.terminal_text.toPlainText()
+        if rendered and current and not current.endswith("\n"):
+            rendered = "\n" + rendered
+        self._append_terminal(rendered)
+
+    def _flush_terminal_output(self, state: _TerminalCommandState) -> None:
+        for stream in ("stdout", "stderr"):
+            value = state.pending[stream]
+            state.pending[stream] = ""
+            if value:
+                self._render_terminal_output_piece(state, stream, value)
+        state.discarding.clear()
+
+    @classmethod
+    def _format_terminal_lines(
+        cls, source: str, value: str, at_line_start: bool
+    ) -> tuple[str, bool]:
+        cleaned = cls._clean_terminal_text(value)
+        if not cleaned:
+            return "", at_line_start
+        rendered: list[str] = []
+        for line in cleaned.splitlines(keepends=True):
+            if at_line_start:
+                rendered.append(f"[{source}] ")
+            rendered.append(line)
+            at_line_start = line.endswith("\n")
+        return "".join(rendered), at_line_start
+
+    def _settle_terminal_commands(self, state: str) -> None:
+        if not self._terminal_commands:
+            return
+        for command_state in tuple(self._terminal_commands.values()):
+            self._flush_terminal_output(command_state)
+            current = self.terminal_text.toPlainText()
+            if current and not current.endswith("\n"):
+                self._append_terminal("\n")
+            self._append_terminal(f"[{state}]\n\n")
+        self._terminal_commands.clear()
+
+    def _append_terminal(self, value: str) -> None:
+        safe_value = self._clean_terminal_text(value)
+        if not safe_value:
+            return
+        scroll = self.terminal_text.verticalScrollBar()
+        follow_latest = scroll.value() >= scroll.maximum() - 2
+        previous_scroll_value = scroll.value()
+        cursor = QTextCursor(self.terminal_text.document())
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(safe_value)
+        if self.terminal_text.document().characterCount() > self.MAX_TERMINAL_CHARS:
+            marker = "[earlier output omitted]\n"
+            current = self.terminal_text.toPlainText()
+            retained = current[-self.TERMINAL_TRIM_CHARS :]
+            first_newline = retained.find("\n")
+            if first_newline >= 0:
+                retained = retained[first_newline + 1 :]
+            trimmed = marker + retained
+            self.terminal_text.setPlainText(trimmed)
+        if follow_latest:
+            scroll.setValue(scroll.maximum())
+        else:
+            scroll.setValue(min(previous_scroll_value, scroll.maximum()))
+
+    @classmethod
+    def _clean_terminal_text(cls, value: str) -> str:
+        safe_value = redact_secrets(value)
+        safe_value = cls.ANSI_ESCAPE_RE.sub("", safe_value)
+        safe_value = safe_value.replace("\r\n", "\n").replace("\r", "\n")
+        safe_value = re.sub(r"[\x85\u2028\u2029]", "\n", safe_value)
+        safe_value = cls.CONTROL_CHAR_RE.sub("", safe_value)
+        safe_value = cls.BIDI_CONTROL_RE.sub("", safe_value)
+        safe_value = redact_secrets(safe_value)
+        if len(safe_value) <= cls.MAX_TERMINAL_CHUNK_CHARS:
+            return safe_value
+        marker = "\n[earlier output omitted]\n"
+        head = cls.MAX_TERMINAL_CHUNK_CHARS * 2 // 3
+        tail = cls.MAX_TERMINAL_CHUNK_CHARS - head - len(marker)
+        return safe_value[:head] + marker + safe_value[-tail:]
 
     def _set_details_text(self, value: str) -> None:
         self._replace_text(self.details_text, value)

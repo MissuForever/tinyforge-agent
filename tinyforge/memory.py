@@ -23,19 +23,40 @@ SECRET_PATTERNS = (
         r"(?i)((?:api[_-]?key|access[_-]?key(?:[_-]?id)?|"
         r"(?:access|api|auth|refresh|session)[_-]?token|token|authorization|credential|"
         r"github[_-]?pat|passphrase|password|private[_-]?key|secret|session[_-]?cookie)"
-        r"[\"']?\s*[=:]\s*)([\"'])(.*?)\2"
+        r"[\"']?\s*[=:]\s*)([\"'])"
+        r"((?:(?:\\|`)[\s\S]|\2\2|(?!\2)[\s\S])*)(\2|\Z)"
     ),
     re.compile(
         r"(?i)((?:api[_-]?key|access[_-]?key(?:[_-]?id)?|"
         r"(?:access|api|auth|refresh|session)[_-]?token|token|authorization|credential|"
         r"github[_-]?pat|passphrase|password|private[_-]?key|secret|session[_-]?cookie)"
         r"[\"']?\s*[=:]\s*(?:bearer\s+)?)(?!\s*[\"']|\s*\[REDACTED)"
+        r"(?!\s*bearer\s+\[REDACTED)"
         r"([^,;\r\n;}\]]+)"
     ),
     re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{12,}"),
     re.compile(
         r"(?i)(?<![a-z0-9+.-])([a-z][a-z0-9+.-]*://[^:/\s@]+:)([^@\s/]+)(@)"
     ),
+)
+_CLI_SECRET_SUFFIX = (
+    r"api[_-]?key|access[_-]?key(?:[_-]?id)?|"
+    r"(?:access|api|auth|refresh|session)[_-]?token|token|authorization|credential|"
+    r"github[_-]?pat|passphrase|password|passwd|private[_-]?key|secret|"
+    r"session[_-]?cookie|auth|pat"
+)
+_CLI_SECRET_KEY = rf"(?:key|(?:[a-z0-9]+[_-])*(?:{_CLI_SECRET_SUFFIX}))"
+_CLI_QUOTED_SECRET = re.compile(
+    rf"(?i)((?<![\w-])--?(?:{_CLI_SECRET_KEY})\s+)([\"'])"
+    r"((?:(?:\\|`)[\s\S]|\2\2|(?!\2)[\s\S])*)(\2|\Z)"
+)
+_CLI_BEARER_SECRET = re.compile(
+    rf"(?i)((?<![\w-])--?(?:{_CLI_SECRET_KEY})\s+bearer\s+)"
+    r"(?!\[REDACTED(?:_API_KEY)?\])([^\s;&|]+)"
+)
+_CLI_UNQUOTED_SECRET = re.compile(
+    rf"(?i)((?<![\w-])--?(?:{_CLI_SECRET_KEY})\s+)"
+    r"(?!bearer(?:\s|$)|\[REDACTED(?:_API_KEY)?\])([^\s;&|]+)"
 )
 
 _LOCAL_LOCKS: dict[str, threading.Lock] = {}
@@ -60,8 +81,11 @@ def _clip(value: str, limit: int) -> str:
 
 def redact_secrets(value: str) -> str:
     value = value.encode("utf-8", errors="replace").decode("utf-8")
-    redacted = SECRET_PATTERNS[4].sub(r"\1[REDACTED]\3", value)
-    redacted = SECRET_PATTERNS[1].sub(r"\1\2[REDACTED]\2", redacted)
+    redacted = _CLI_QUOTED_SECRET.sub(r"\1\2[REDACTED]\4", value)
+    redacted = _CLI_BEARER_SECRET.sub(r"\1[REDACTED]", redacted)
+    redacted = _CLI_UNQUOTED_SECRET.sub(r"\1[REDACTED]", redacted)
+    redacted = SECRET_PATTERNS[4].sub(r"\1[REDACTED]\3", redacted)
+    redacted = SECRET_PATTERNS[1].sub(r"\1\2[REDACTED]\4", redacted)
     redacted = SECRET_PATTERNS[2].sub(r"\1[REDACTED]", redacted)
     redacted = SECRET_PATTERNS[0].sub("[REDACTED_API_KEY]", redacted)
     return SECRET_PATTERNS[3].sub(r"\1[REDACTED]", redacted)

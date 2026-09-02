@@ -61,6 +61,175 @@ class AgentTests(unittest.TestCase):
             self.assertTrue(json.loads(tool_message["content"])["ok"])
             self.assertIn("tool_start", [event.kind for event in events])
 
+    def test_tool_progress_is_emitted_before_structured_tool_result(self) -> None:
+        output = json.dumps(
+            {
+                "ok": True,
+                "result": {
+                    "command": "check-project",
+                    "cwd": ".",
+                    "exit_code": 0,
+                    "stdout": "checking\npassed\n",
+                    "stderr": "warning\n",
+                },
+            }
+        )
+        progress_calls: list[tuple[str, str, str]] = []
+
+        class StreamingTools:
+            definitions: list[dict[str, object]] = []
+
+            def execute(self, name: str, arguments: str) -> str:
+                raise AssertionError("Agent should prefer execute_with_progress")
+
+            def execute_with_progress(self, name, arguments, on_progress):
+                progress_calls.append((name, arguments, "started"))
+                on_progress("stdout", "checking\n")
+                on_progress("stderr", "warning\n")
+                on_progress("stdout", "passed\n")
+                return output
+
+        model = ScriptedModel(
+            [
+                AssistantReply(
+                    "Checking the project.",
+                    (ToolCall("command-1", "run_command", '{"command":"check-project"}'),),
+                ),
+                AssistantReply("TASK_COMPLETE: The project check passed."),
+            ]
+        )
+        events: list[AgentEvent] = []
+        cancel_event = threading.Event()
+        with tempfile.TemporaryDirectory() as temp:
+            result = Agent(
+                model=model,
+                tools=StreamingTools(),
+                workspace=Path(temp),
+                on_event=events.append,
+            ).run("Check the project", cancel_event=cancel_event)
+
+        self.assertTrue(result.success)
+        self.assertEqual(
+            progress_calls,
+            [("run_command", '{"command":"check-project"}', "started")],
+        )
+        command_events = [
+            event for event in events if event.data.get("call_id") == "command-1"
+        ]
+        self.assertEqual(
+            [event.kind for event in command_events],
+            ["tool_start", "tool_output", "tool_output", "tool_output", "tool_end"],
+        )
+        self.assertEqual(
+            [event.data for event in command_events[1:-1]],
+            [
+                {
+                    "call_id": "command-1",
+                    "name": "run_command",
+                    "stream": "stdout",
+                    "text": "checking\n",
+                },
+                {
+                    "call_id": "command-1",
+                    "name": "run_command",
+                    "stream": "stderr",
+                    "text": "warning\n",
+                },
+                {
+                    "call_id": "command-1",
+                    "name": "run_command",
+                    "stream": "stdout",
+                    "text": "passed\n",
+                },
+            ],
+        )
+        tool_message = model.calls[1][-1]
+        self.assertEqual(tool_message["role"], "tool")
+        self.assertEqual(tool_message["tool_call_id"], "command-1")
+        self.assertEqual(tool_message["content"], output)
+
+    def test_cancel_event_is_forwarded_to_aware_progress_provider(self) -> None:
+        cancel_event = threading.Event()
+        received: list[threading.Event | None] = []
+
+        class CancellationAwareTools:
+            definitions: list[dict[str, object]] = []
+
+            def execute(self, name: str, arguments: str) -> str:
+                raise AssertionError("Agent should prefer execute_with_progress")
+
+            def execute_with_progress(
+                self,
+                name,
+                arguments,
+                on_progress,
+                *,
+                cancel_event=None,
+            ):
+                received.append(cancel_event)
+                cancel_event.set()
+                return json.dumps(
+                    {"ok": False, "cancelled": True, "error": "Command cancelled by user"}
+                )
+
+        model = ScriptedModel(
+            [
+                AssistantReply(
+                    "Starting a cancellable command.",
+                    (ToolCall("cancel-1", "run_command", '{"command":"wait"}'),),
+                )
+            ]
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            agent = Agent(
+                model=model,
+                tools=CancellationAwareTools(),
+                workspace=Path(temp),
+            )
+            result = agent.run("Stop the command", cancel_event=cancel_event)
+
+        self.assertTrue(result.cancelled)
+        self.assertEqual(received, [cancel_event])
+        tool_messages = [message for message in agent.messages if message["role"] == "tool"]
+        self.assertTrue(json.loads(tool_messages[0]["content"])["cancelled"])
+
+    def test_agent_falls_back_to_legacy_tool_provider_without_progress(self) -> None:
+        calls: list[tuple[str, str]] = []
+        output = json.dumps({"ok": True, "result": {"value": 42}})
+
+        class LegacyTools:
+            definitions: list[dict[str, object]] = []
+
+            def execute(self, name: str, arguments: str) -> str:
+                calls.append((name, arguments))
+                return output
+
+        model = ScriptedModel(
+            [
+                AssistantReply(
+                    "Using the existing tool interface.",
+                    (ToolCall("legacy-1", "legacy_tool", '{"value":42}'),),
+                ),
+                AssistantReply("TASK_COMPLETE: Legacy tool execution succeeded."),
+            ]
+        )
+        events: list[AgentEvent] = []
+        with tempfile.TemporaryDirectory() as temp:
+            result = Agent(
+                model=model,
+                tools=LegacyTools(),
+                workspace=Path(temp),
+                on_event=events.append,
+            ).run("Use a legacy provider")
+
+        self.assertTrue(result.success)
+        self.assertEqual(calls, [("legacy_tool", '{"value":42}')])
+        legacy_events = [
+            event for event in events if event.data.get("call_id") == "legacy-1"
+        ]
+        self.assertEqual([event.kind for event in legacy_events], ["tool_start", "tool_end"])
+        self.assertEqual(model.calls[1][-1]["content"], output)
+
     def test_repeated_tool_calls_stop_the_loop(self) -> None:
         repeated = [
             AssistantReply(

@@ -16,7 +16,7 @@ Chat Completions 或 Responses API，解析模型原生 tool calling，在本机
 - `edit_file`：精确局部替换，避免意外修改多处内容
 - `run_command`：在工作区执行 PowerShell 或 POSIX shell 命令
 - 单任务与连续对话两种 CLI 使用方式
-- PySide6 桌面操作台：实时执行时间线、工具详情、代码 Diff 和记忆概览
+- PySide6 桌面操作台：实时执行时间线、工具详情、代码 Diff、记忆概览和命令输出
 - 工具异常结构化回传，模型可读取错误并自行修正
 - 命令超时、工作区路径隔离、危险命令拦截
 - 工具输出截断、对话上下文裁剪、最大轮数和重复调用保护
@@ -88,7 +88,8 @@ py -3 -m tinyforge.gui
 可通过 `-w D:\path\to\project` 指定初始工作区。GUI 使用 PySide6 和 Qt Widgets，Qt 6
 默认跟随操作系统的高 DPI 与逐显示器缩放；Agent 在单独的后台线程运行，工具事件通过
 队列送回 GUI 线程，因此模型请求和命令执行不会冻结窗口。界面不会显示或保存 API Key，
-配置仍来自环境变量或未入库的 `.env`。
+配置仍来自环境变量或未入库的 `.env`。`Terminal` 标签会按行显示 Agent 执行的命令、
+标准输出、错误输出和退出码；它是只读审计视图，不提供任意命令输入入口。
 
 需要保留主屏工作时，可让窗口直接在副屏居中打开，无需手动拖动：
 
@@ -117,7 +118,8 @@ tinyforge-gui --help
    -> 模型请求（压缩历史 + JSON Schema 工具定义）
    -> assistant 文本或 tool_calls
    -> 校验工具名与 JSON 参数
-   -> 本地执行工具并生成结构化结果
+   -> 本地执行工具；命令输出以有界事件实时送往 GUI
+   -> 生成有界的结构化工具结果
    -> 结果作为 tool 消息加入历史
    -> 继续调用模型，直到明确的 TASK_COMPLETE/TASK_BLOCKED 或触发终止条件
 ```
@@ -192,6 +194,16 @@ Remove-Item Env:QT_QPA_PLATFORM
 
 ## 两分钟演示
 
+完整 GUI 录制与神经语音渲染依赖可单独安装，不影响核心 Runtime：
+
+```powershell
+py -3 -m pip install -e ".[demo]"
+```
+
+默认渲染优先使用联网的 `zh-CN-XiaoxiaoNeural`，失败时整批回退到 Windows 已安装的本地
+语音；最终 MP4 的音轨可完全离线播放。可复现录制、严格两分钟渲染和代理参数见
+[`docs/demo-script.md`](docs/demo-script.md)。
+
 生成一个带真实缺陷和测试的独立工作区：
 
 ```powershell
@@ -211,7 +223,8 @@ py -3 -m tinyforge -w .demo/order_total "阅读 README 和测试，修复订单�
 ## 已知边界
 
 - 当前实现非流式 Chat Completions 与 Responses API，不包含流式事件解析。
-- GUI 停止操作采用协作式取消：会阻止后续步骤，但正在执行的 HTTP 请求或命令需先返回。
+- GUI 停止操作采用协作式取消：会终止正在执行的命令进程树并阻止后续步骤；正在执行的
+  HTTP 请求仍需先返回。
 - 上下文使用中英文加权估算而非厂商 tokenizer，仍可能与实际计费 Token 存在偏差。
 - 长期记忆依赖模型主动形成高质量候选，尚未实现冲突过期和自动代码化技能。
 - 危险命令检测基于规则，不能代替容器级隔离。

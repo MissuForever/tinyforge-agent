@@ -39,6 +39,79 @@ class WorkingMemoryTests(unittest.TestCase):
                 self.assertIn("[REDACTED", redacted)
                 self.assertNotIn("]]", redacted)
 
+    def test_redaction_is_idempotent_for_bearer_markers(self) -> None:
+        value = "Authorization: Bearer abcdefghijklmnop"
+        redacted = redact_secrets(value)
+        self.assertEqual(redact_secrets(redacted), redacted)
+        self.assertEqual(redacted, "Authorization: Bearer [REDACTED]")
+
+    def test_redaction_handles_cli_secret_flags(self) -> None:
+        secrets = (
+            "plain-api-secret",
+            "password with spaces",
+            "abcdefghijklmnop-token",
+            "authorization-token-value",
+            "ordinary-client-secret",
+            "ordinary-proxy-password",
+            "ordinary-secret-access-key",
+            "ordinary-github-token",
+        )
+        command = (
+            f"tool --api-key {secrets[0]} "
+            f"--password \"{secrets[1]}\" "
+            f"--token {secrets[2]} "
+            f"--authorization Bearer {secrets[3]} "
+            f"--client-secret {secrets[4]} "
+            f"--proxy-password {secrets[5]} "
+            f"--secret-access-key {secrets[6]} "
+            f"--github-token {secrets[7]}"
+        )
+        redacted = redact_secrets(command)
+
+        for secret in secrets:
+            self.assertNotIn(secret, redacted)
+        self.assertEqual(redact_secrets(redacted), redacted)
+        self.assertEqual(redacted.count("[REDACTED]"), 8)
+
+    def test_redaction_handles_escaped_quotes_in_secret_values(self) -> None:
+        samples = (
+            'tool --password "alpha\\"SECRET TAIL" --mode safe',
+            'tool --password "alpha`"SECRET TAIL" --mode safe',
+            'tool --password "alpha""SECRET TAIL" --mode safe',
+            'password="alpha\\"SECRET TAIL"; mode=safe',
+        )
+        for sample in samples:
+            with self.subTest(sample=sample):
+                redacted = redact_secrets(sample)
+                self.assertNotIn("SECRET TAIL", redacted)
+                self.assertIn("safe", redacted)
+                self.assertEqual(redact_secrets(redacted), redacted)
+
+    def test_redaction_handles_multiline_and_unclosed_quoted_secrets(self) -> None:
+        closed_samples = (
+            'tool --password "line-one\nline-two" --mode safe',
+            'private_key="line-one\nline-two"\nmode=safe',
+        )
+        for sample in closed_samples:
+            with self.subTest(sample=sample):
+                redacted = redact_secrets(sample)
+                self.assertNotIn("line-one", redacted)
+                self.assertNotIn("line-two", redacted)
+                self.assertIn("safe", redacted)
+                self.assertEqual(redact_secrets(redacted), redacted)
+
+        unclosed = 'tool --password "line-one\nline-two'
+        redacted = redact_secrets(unclosed)
+        self.assertNotIn("line-one", redacted)
+        self.assertNotIn("line-two", redacted)
+        self.assertEqual(redact_secrets(redacted), redacted)
+
+    def test_redaction_does_not_treat_every_key_suffix_as_secret(self) -> None:
+        self.assertEqual(
+            redact_secrets("tool --sort-key filename --key actual-secret"),
+            "tool --sort-key filename --key [REDACTED]",
+        )
+
     def test_checkpoint_anchor_is_bounded_and_keeps_recent_events(self) -> None:
         memory = WorkingMemory()
         memory.start("Fix the project without changing tests")

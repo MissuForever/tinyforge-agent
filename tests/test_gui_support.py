@@ -11,10 +11,12 @@ from tinyforge.agent import AgentEvent, AgentResult
 from tinyforge.config import Config
 from tinyforge.gui_support import (
     MAX_UI_EVENT_CHARS,
+    MAX_UI_STREAM_LINE,
     MAX_UI_TEXT,
     AgentWorker,
     GuiEventBridge,
     UiEnvelope,
+    command_terminal_result,
     sanitize_agent_event,
     snapshot_text_file,
     summarize_tool_output,
@@ -287,6 +289,449 @@ class GuiSupportTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(summary, "exit=1; failed")
 
+    def test_command_terminal_result_preserves_status_and_handles_bad_payloads(self) -> None:
+        success = command_terminal_result(
+            json.dumps(
+                {
+                    "ok": True,
+                    "result": {
+                        "exit_code": 7,
+                        "stdout": "partial output\n",
+                        "stderr": "failed\n",
+                        "truncated": True,
+                    },
+                }
+            )
+        )
+        self.assertEqual(success["exit_code"], 7)
+        self.assertEqual(success["stdout"], "partial output\n")
+        self.assertEqual(success["stderr"], "failed\n")
+        self.assertTrue(success["truncated"])
+
+        cases = (
+            ("not-json", False),
+            ("[]", False),
+            (json.dumps({"ok": True}), False),
+            (json.dumps({"ok": False, "error": "blocked"}), True),
+        )
+        for raw, parsed in cases:
+            with self.subTest(raw=raw):
+                result = command_terminal_result(raw)
+                self.assertEqual(result["parsed"], parsed)
+                self.assertIn("error", result)
+
+        boolean_exit = command_terminal_result(
+            json.dumps({"ok": True, "result": {"exit_code": True}})
+        )
+        self.assertNotIn("exit_code", boolean_exit)
+
+        timeout = command_terminal_result(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": (
+                        "Command timed out after 1s. Partial stdout: already streamed\n"
+                        "Partial stderr: also streamed"
+                    ),
+                }
+            )
+        )
+        self.assertEqual(timeout["error"], "Command timed out after 1s.")
+
+        cancelled = command_terminal_result(
+            json.dumps(
+                {
+                    "ok": False,
+                    "cancelled": True,
+                    "error": "Command cancelled by user",
+                }
+            )
+        )
+        self.assertTrue(cancelled["cancelled"])
+
+    def test_command_event_redacts_cli_secret_flags(self) -> None:
+        secret = "plain-command-line-secret"
+        safe = sanitize_agent_event(
+            AgentEvent(
+                "tool_start",
+                {
+                    "call_id": "secret-command",
+                    "name": "run_command",
+                    "arguments": {
+                        "command": f"tool --proxy-password {secret}",
+                        "cwd": ".",
+                    },
+                },
+            )
+        )
+        rendered = safe.data["arguments"]["command"]
+        self.assertNotIn(secret, rendered)
+        self.assertIn("--proxy-password [REDACTED]", rendered)
+
+    def test_command_event_marks_a_truncated_command_explicitly(self) -> None:
+        command = "head " + "x" * (MAX_UI_TEXT + 1_000) + " tail"
+        safe = sanitize_agent_event(
+            AgentEvent(
+                "tool_start",
+                {
+                    "call_id": "long-command",
+                    "name": "run_command",
+                    "arguments": {"command": command, "cwd": "."},
+                },
+            )
+        )
+        rendered = safe.data["arguments"]["command"]
+        self.assertLessEqual(len(rendered), MAX_UI_TEXT)
+        self.assertIn("head ", rendered)
+        self.assertIn(" tail", rendered)
+        self.assertIn("[command truncated]", rendered)
+
+    def test_command_terminal_result_redacts_and_bounds_streams(self) -> None:
+        api_key = "sk-abcdefghijklmnopqrstuvwxyz123456"
+        bearer = "bearer-token-abcdefghijklmnop"
+        password = "database-password"
+        result = command_terminal_result(
+            json.dumps(
+                {
+                    "ok": True,
+                    "result": {
+                        "exit_code": 0,
+                        "stdout": (
+                            f"OPENAI_API_KEY={api_key}\n"
+                            f"Authorization: Bearer {bearer}\n" + "x" * 30_000
+                        ),
+                        "stderr": (
+                            f"postgres://user:{password}@host/db\n" + "y" * 30_000
+                        ),
+                    },
+                }
+            )
+        )
+        serialized = json.dumps(result)
+        self.assertNotIn(api_key, serialized)
+        self.assertNotIn(bearer, serialized)
+        self.assertNotIn(password, serialized)
+        self.assertIn("REDACTED", serialized)
+        self.assertLessEqual(len(result["stdout"]) + len(result["stderr"]), MAX_UI_TEXT * 2)
+
+    def test_bridge_sanitizes_stream_events_and_only_adds_command_result(self) -> None:
+        secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+        events: queue.Queue[UiEnvelope] = queue.Queue()
+        with tempfile.TemporaryDirectory() as temp:
+            bridge = GuiEventBridge(events, "run-stream", Path(temp))
+            bridge(
+                AgentEvent(
+                    "tool_output",
+                    {
+                        "call_id": "command-1",
+                        "name": "run_command",
+                        "stream": "stdout",
+                        "text": secret + "x" * (MAX_UI_TEXT + 100),
+                    },
+                )
+            )
+            bridge(
+                AgentEvent(
+                    "tool_end",
+                    {
+                        "call_id": "command-1",
+                        "name": "run_command",
+                        "output": json.dumps(
+                            {"ok": True, "result": {"exit_code": 0, "stdout": "done"}}
+                        ),
+                    },
+                )
+            )
+            bridge(
+                AgentEvent(
+                    "tool_end",
+                    {
+                        "call_id": "read-1",
+                        "name": "read_file",
+                        "output": json.dumps({"ok": True, "result": {"path": "a.txt"}}),
+                    },
+                )
+            )
+
+        streamed = events.get(timeout=1).payload
+        command_end = events.get(timeout=1).payload
+        read_end = events.get(timeout=1).payload
+        self.assertEqual(streamed.data["call_id"], "command-1")
+        self.assertEqual(streamed.data["stream"], "stdout")
+        self.assertNotIn(secret, streamed.data["text"])
+        self.assertLessEqual(len(streamed.data["text"]), MAX_UI_TEXT)
+        self.assertEqual(command_end.data["terminal_result"]["exit_code"], 0)
+        self.assertNotIn("terminal_result", read_end.data)
+
+    def test_bridge_redacts_secrets_split_across_stream_events(self) -> None:
+        first_half = "ABCDEFGHIJKL"
+        second_half = "MNOPQRSTUVWX"
+        events: queue.Queue[UiEnvelope] = queue.Queue()
+        with tempfile.TemporaryDirectory() as temp:
+            bridge = GuiEventBridge(events, "run-split-secret", Path(temp))
+            bridge(
+                AgentEvent(
+                    "tool_output",
+                    {
+                        "call_id": "command-secret",
+                        "name": "run_command",
+                        "stream": "stdout",
+                        "text": f"Authorization: Bearer {first_half}",
+                    },
+                )
+            )
+            self.assertTrue(events.empty())
+            bridge(
+                AgentEvent(
+                    "tool_output",
+                    {
+                        "call_id": "command-secret",
+                        "name": "run_command",
+                        "stream": "stdout",
+                        "text": second_half + "\n",
+                    },
+                )
+            )
+
+        event = events.get(timeout=1).payload
+        rendered = event.data["text"]
+        self.assertIn("REDACTED", rendered)
+        self.assertNotIn(first_half, rendered)
+        self.assertNotIn(second_half, rendered)
+
+    def test_bridge_batches_many_complete_lines_from_one_chunk(self) -> None:
+        output = "".join(f"line {index:04d}\n" for index in range(5_000))
+        events: queue.Queue[UiEnvelope] = queue.Queue()
+        with tempfile.TemporaryDirectory() as temp:
+            bridge = GuiEventBridge(events, "run-batched", Path(temp))
+            bridge(
+                AgentEvent(
+                    "tool_output",
+                    {
+                        "call_id": "command-batched",
+                        "name": "run_command",
+                        "stream": "stdout",
+                        "text": output,
+                    },
+                )
+            )
+
+        rendered = []
+        while not events.empty():
+            event = events.get_nowait().payload
+            self.assertLessEqual(len(event.data["text"]), MAX_UI_TEXT)
+            rendered.append(event.data["text"])
+        self.assertLessEqual(len(rendered), 3)
+        self.assertEqual("".join(rendered), output)
+
+    def test_saturated_queue_does_not_block_terminal_progress(self) -> None:
+        events: queue.Queue[UiEnvelope] = queue.Queue(maxsize=1)
+        events.put(UiEnvelope("existing", "event", object()))
+        with tempfile.TemporaryDirectory() as temp:
+            bridge = GuiEventBridge(events, "run-busy", Path(temp))
+            producer = threading.Thread(
+                target=bridge,
+                args=(
+                    AgentEvent(
+                        "tool_output",
+                        {
+                            "call_id": "command-busy",
+                            "name": "run_command",
+                            "stream": "stdout",
+                            "text": "first line\n",
+                        },
+                    ),
+                ),
+                daemon=True,
+            )
+            producer.start()
+            producer.join(1)
+
+        self.assertFalse(producer.is_alive())
+        self.assertEqual(events.qsize(), 1)
+
+    def test_bridge_reports_busy_queue_omission_before_command_end(self) -> None:
+        events: queue.Queue[UiEnvelope] = queue.Queue(maxsize=2)
+        events.put(UiEnvelope("existing-1", "event", object()))
+        events.put(UiEnvelope("existing-2", "event", object()))
+        with tempfile.TemporaryDirectory() as temp:
+            bridge = GuiEventBridge(events, "run-busy-end", Path(temp))
+            bridge(
+                AgentEvent(
+                    "tool_output",
+                    {
+                        "call_id": "command-busy-end",
+                        "name": "run_command",
+                        "stream": "stderr",
+                        "text": "dropped line\n",
+                    },
+                )
+            )
+            events.get_nowait()
+            events.get_nowait()
+            bridge(
+                AgentEvent(
+                    "tool_output",
+                    {
+                        "call_id": "command-busy-end",
+                        "name": "run_command",
+                        "stream": "stderr",
+                        "text": "also dropped\n",
+                    },
+                )
+            )
+            self.assertTrue(events.empty())
+            bridge(
+                AgentEvent(
+                    "tool_end",
+                    {
+                        "call_id": "command-busy-end",
+                        "name": "run_command",
+                        "output": json.dumps(
+                            {"ok": True, "result": {"exit_code": 0, "stderr": ""}}
+                        ),
+                    },
+                )
+            )
+
+        omitted = events.get_nowait().payload
+        finished = events.get_nowait().payload
+        self.assertEqual(omitted.kind, "tool_output")
+        self.assertEqual(omitted.data["stream"], "stderr")
+        self.assertEqual(omitted.data["text"], "[output omitted: GUI queue was busy]\n")
+        self.assertEqual(finished.kind, "tool_end")
+        self.assertEqual(bridge._dropped_terminal_streams, set())
+
+    def test_bridge_flushes_safe_partial_line_before_command_end(self) -> None:
+        events: queue.Queue[UiEnvelope] = queue.Queue()
+        with tempfile.TemporaryDirectory() as temp:
+            bridge = GuiEventBridge(events, "run-partial", Path(temp))
+            bridge(
+                AgentEvent(
+                    "tool_output",
+                    {
+                        "call_id": "command-partial",
+                        "name": "run_command",
+                        "stream": "stdout",
+                        "text": "ready without newline",
+                    },
+                )
+            )
+            self.assertTrue(events.empty())
+            bridge(
+                AgentEvent(
+                    "tool_end",
+                    {
+                        "call_id": "command-partial",
+                        "name": "run_command",
+                        "output": json.dumps(
+                            {
+                                "ok": True,
+                                "result": {"exit_code": 0, "stdout": "ready without newline"},
+                            }
+                        ),
+                    },
+                )
+            )
+
+        progress = events.get(timeout=1).payload
+        finished = events.get(timeout=1).payload
+        self.assertEqual(progress.kind, "tool_output")
+        self.assertEqual(progress.data["text"], "ready without newline")
+        self.assertEqual(finished.kind, "tool_end")
+
+    def test_bridge_omits_oversized_lines_and_clears_discard_state(self) -> None:
+        events: queue.Queue[UiEnvelope] = queue.Queue()
+        with tempfile.TemporaryDirectory() as temp:
+            bridge = GuiEventBridge(events, "run-oversized", Path(temp))
+            bridge(
+                AgentEvent(
+                    "tool_output",
+                    {
+                        "call_id": "command-large-line",
+                        "name": "run_command",
+                        "stream": "stdout",
+                        "text": "x" * (MAX_UI_STREAM_LINE + 1),
+                    },
+                )
+            )
+            bridge(
+                AgentEvent(
+                    "tool_output",
+                    {
+                        "call_id": "command-large-line",
+                        "name": "run_command",
+                        "stream": "stdout",
+                        "text": "discarded remainder\nvisible next line\n",
+                    },
+                )
+            )
+            bridge(
+                AgentEvent(
+                    "tool_end",
+                    {
+                        "call_id": "command-large-line",
+                        "name": "run_command",
+                        "output": json.dumps(
+                            {"ok": True, "result": {"exit_code": 0, "stdout": ""}}
+                        ),
+                    },
+                )
+            )
+
+            omitted = events.get(timeout=1).payload
+            visible = events.get(timeout=1).payload
+            finished = events.get(timeout=1).payload
+            self.assertIn("output line omitted", omitted.data["text"])
+            self.assertEqual(visible.data["text"], "visible next line\n")
+            self.assertEqual(finished.kind, "tool_end")
+            self.assertEqual(bridge._terminal_lines, {})
+            self.assertEqual(bridge._discarding_terminal_lines, set())
+
+    def test_duplicate_command_start_discards_stale_partial_output(self) -> None:
+        events: queue.Queue[UiEnvelope] = queue.Queue()
+        stale = "Authorization: Bearer stale-partial-token"
+        with tempfile.TemporaryDirectory() as temp:
+            bridge = GuiEventBridge(events, "run-duplicate", Path(temp))
+            start = AgentEvent(
+                "tool_start",
+                {
+                    "call_id": "duplicate-command",
+                    "name": "run_command",
+                    "arguments": {"command": "verify", "cwd": "."},
+                },
+            )
+            bridge(start)
+            bridge(
+                AgentEvent(
+                    "tool_output",
+                    {
+                        "call_id": "duplicate-command",
+                        "name": "run_command",
+                        "stream": "stdout",
+                        "text": stale,
+                    },
+                )
+            )
+            bridge(start)
+            bridge(
+                AgentEvent(
+                    "tool_output",
+                    {
+                        "call_id": "duplicate-command",
+                        "name": "run_command",
+                        "stream": "stdout",
+                        "text": "fresh output\n",
+                    },
+                )
+            )
+
+        rendered = [events.get(timeout=1).payload for _ in range(3)]
+        serialized = "\n".join(str(event.data) for event in rendered)
+        self.assertNotIn(stale, serialized)
+        self.assertEqual(rendered[-1].data["text"], "fresh output\n")
+        self.assertEqual(bridge._terminal_lines, {})
+
     def test_large_tool_output_keeps_structured_success_status(self) -> None:
         output = json.dumps(
             {"ok": True, "result": {"exit_code": 0, "stdout": "x" * 25_000}}
@@ -304,6 +749,8 @@ class GuiSupportTests(unittest.TestCase):
         self.assertTrue(event.data["output_ok"])
         self.assertTrue(event.data["output_summary"].startswith("exit=0"))
         self.assertLessEqual(len(event.data["output"]), 20_000)
+        self.assertTrue(event.data["terminal_result"]["parsed"])
+        self.assertEqual(event.data["terminal_result"]["exit_code"], 0)
 
     def test_redaction_happens_before_ui_text_is_truncated(self) -> None:
         value = "x" * 19_980 + " postgres://user:password-super-secret@host/db"

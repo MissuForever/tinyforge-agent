@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import json
 import math
+import os
 import re
 import subprocess
+import sys
+import tempfile
 import wave
 from array import array
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Sequence
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -19,6 +23,11 @@ from PIL import Image, ImageDraw, ImageFont
 ROOT = Path(__file__).resolve().parents[1]
 WIDTH, HEIGHT = 1920, 1080
 FPS = 30
+NARRATION_SAMPLE_RATE = 24_000
+DEFAULT_EDGE_VOICE = "zh-CN-XiaoxiaoNeural"
+DEFAULT_EDGE_RATE = "+5%"
+DEFAULT_SYSTEM_VOICE = "Microsoft Huihui Desktop"
+DEFAULT_SYSTEM_RATE = 3
 INTRO_SECONDS = 8.0
 MEMORY_SECONDS = 9.0
 OUTRO_SECONDS = 11.0
@@ -121,7 +130,7 @@ def make_outro(path: Path, result: dict[str, Any]) -> None:
     draw.text((72, 760), stats, font=font(SANS, 28), fill=CYAN)
     draw.text(
         (72, 825),
-        "主项目 76 / 76 测试通过 · GUI smoke、构建产物与真实端点均已验证",
+        "主项目完整测试通过 · GUI smoke、构建产物与真实端点均已验证",
         font=font(SANS, 27),
         fill=YELLOW,
     )
@@ -177,23 +186,270 @@ def make_memory_card(path: Path, result: dict[str, Any]) -> None:
     image.save(path, optimize=True)
 
 
-def synthesize(text: str, destination: Path) -> None:
-    escaped_path = str(destination).replace("'", "''")
-    escaped_text = text.replace("'", "''")
-    script = (
-        "Add-Type -AssemblyName System.Speech;"
-        "$s=[System.Speech.Synthesis.SpeechSynthesizer]::new();"
-        "$s.SelectVoice('Microsoft Huihui Desktop');$s.Rate=3;$s.Volume=100;"
-        f"$s.SetOutputToWaveFile('{escaped_path}');$s.Speak('{escaped_text}');"
-        "$s.Dispose()"
+def _powershell_base64(value: str) -> str:
+    return base64.b64encode(value.encode("utf-16le")).decode("ascii")
+
+
+def _validate_canonical_wav(path: Path) -> None:
+    try:
+        with wave.open(str(path), "rb") as stream:
+            actual = (
+                stream.getnchannels(),
+                stream.getsampwidth(),
+                stream.getframerate(),
+                stream.getcomptype(),
+            )
+            frames = stream.getnframes()
+    except (OSError, EOFError, wave.Error) as exc:
+        raise RuntimeError(f"TTS did not produce a readable WAV: {path.name}") from exc
+    expected = (1, 2, NARRATION_SAMPLE_RATE, "NONE")
+    if actual != expected:
+        raise RuntimeError(
+            f"TTS WAV has incompatible audio format: {actual}; expected {expected}"
+        )
+    if frames <= 0:
+        raise RuntimeError(f"TTS WAV contains no audio frames: {path.name}")
+
+
+def _normalize_audio(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="tinyforge-audio-", dir=destination.parent) as temp:
+        normalized = Path(temp) / "normalized.wav"
+        completed = subprocess.run(
+            [
+                str(FFMPEG),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(source),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                str(NARRATION_SAMPLE_RATE),
+                "-c:a",
+                "pcm_s16le",
+                str(normalized),
+            ],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(f"FFmpeg could not normalize TTS audio: {source.name}")
+        _validate_canonical_wav(normalized)
+        normalized.replace(destination)
+
+
+def synthesize_system(
+    text: str,
+    destination: Path,
+    *,
+    voice: str = DEFAULT_SYSTEM_VOICE,
+    rate: int = DEFAULT_SYSTEM_RATE,
+) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="tinyforge-system-tts-", dir=destination.parent) as temp:
+        source = Path(temp) / "speech.wav"
+        encoded_voice = _powershell_base64(voice)
+        encoded_text = _powershell_base64(text)
+        encoded_path = _powershell_base64(str(source))
+        script = (
+            "Add-Type -AssemblyName System.Speech;"
+            "$decode={param($v)[Text.Encoding]::Unicode.GetString("
+            "[Convert]::FromBase64String($v))};"
+            f"$voice=&$decode '{encoded_voice}';"
+            f"$text=&$decode '{encoded_text}';"
+            f"$path=&$decode '{encoded_path}';"
+            "$s=[System.Speech.Synthesis.SpeechSynthesizer]::new();"
+            f"$s.SelectVoice($voice);$s.Rate={rate};$s.Volume=100;"
+            "$s.SetOutputToWaveFile($path);$s.Speak($text);$s.Dispose()"
+        )
+        encoded_script = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-EncodedCommand", encoded_script],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        _normalize_audio(source, destination)
+
+
+class EdgeTTSUnavailableError(RuntimeError):
+    pass
+
+
+async def _save_edge_audio(
+    text: str,
+    source: Path,
+    *,
+    voice: str,
+    rate: str,
+    proxy: str | None,
+) -> None:
+    failure: str | None = None
+    try:
+        import edge_tts
+
+        communicate = edge_tts.Communicate(
+            text,
+            voice,
+            rate=rate,
+            proxy=proxy,
+            connect_timeout=15,
+            receive_timeout=90,
+        )
+        await communicate.save(str(source))
+    except ImportError:
+        failure = "edge-tts is not installed; install the project's demo extra"
+    except Exception as exc:
+        failure = f"Edge TTS request failed ({type(exc).__name__})"
+    if failure is not None:
+        raise EdgeTTSUnavailableError(failure) from None
+
+
+def synthesize_edge(
+    text: str,
+    destination: Path,
+    *,
+    voice: str = DEFAULT_EDGE_VOICE,
+    rate: str = DEFAULT_EDGE_RATE,
+    proxy: str | None = None,
+) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="tinyforge-edge-tts-", dir=destination.parent) as temp:
+        source = Path(temp) / "speech.mp3"
+        asyncio.run(
+            _save_edge_audio(text, source, voice=voice, rate=rate, proxy=proxy)
+        )
+        _normalize_audio(source, destination)
+
+
+def _proxy_from_windows() -> str | None:
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        ) as key:
+            enabled = int(winreg.QueryValueEx(key, "ProxyEnable")[0])
+            server = str(winreg.QueryValueEx(key, "ProxyServer")[0]).strip()
+    except (OSError, ValueError):
+        return None
+    if not enabled or not server:
+        return None
+    if ";" in server:
+        entries = dict(
+            part.split("=", 1) for part in server.split(";") if "=" in part
+        )
+        server = entries.get("https") or entries.get("http") or ""
+    if not server:
+        return None
+    return server if "://" in server else f"http://{server}"
+
+
+def detect_tts_proxy() -> str | None:
+    for name in (
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ):
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return _proxy_from_windows()
+
+
+def resolve_tts_proxy(explicit: str | None, disabled: bool) -> str | None:
+    if disabled:
+        return None
+    return explicit or detect_tts_proxy()
+
+
+def _render_tts_batch(
+    texts: Sequence[str],
+    directory: Path,
+    renderer: Callable[[str, Path], None],
+) -> list[Path]:
+    directory.mkdir(parents=True, exist_ok=True)
+    paths = [directory / f"narration-{index:02d}.wav" for index in range(len(texts))]
+    for text, path in zip(texts, paths, strict=True):
+        renderer(text, path)
+    return paths
+
+
+def synthesize_narration(
+    texts: Sequence[str],
+    work: Path,
+    *,
+    backend: str,
+    edge_voice: str,
+    edge_rate: str,
+    system_voice: str,
+    system_rate: int,
+    proxy: str | None,
+) -> tuple[list[Path], dict[str, Any]]:
+    if backend in {"auto", "edge"}:
+        edge_directory = work / "tts-edge"
+        edge_paths = [
+            edge_directory / f"narration-{index:02d}.wav"
+            for index in range(len(texts))
+        ]
+        try:
+            paths = _render_tts_batch(
+                texts,
+                edge_directory,
+                lambda text, path: synthesize_edge(
+                    text, path, voice=edge_voice, rate=edge_rate, proxy=proxy
+                ),
+            )
+            return paths, {
+                "requested_backend": backend,
+                "actual_backend": "edge",
+                "voice": edge_voice,
+                "rate": edge_rate,
+                "sample_rate": NARRATION_SAMPLE_RATE,
+                "fallback": False,
+            }
+        except EdgeTTSUnavailableError as exc:
+            for path in edge_paths:
+                path.unlink(missing_ok=True)
+            if backend == "edge":
+                raise RuntimeError(
+                    f"{exc}; no fallback was requested"
+                ) from None
+            print(
+                f"{exc}; regenerating all narration "
+                "with the local System.Speech voice.",
+                file=sys.stderr,
+            )
+
+    paths = _render_tts_batch(
+        texts,
+        work / "tts-system",
+        lambda text, path: synthesize_system(
+            text, path, voice=system_voice, rate=system_rate
+        ),
     )
-    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
-    subprocess.run(
-        ["powershell.exe", "-NoProfile", "-EncodedCommand", encoded],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-    )
+    return paths, {
+        "requested_backend": backend,
+        "actual_backend": "system",
+        "voice": system_voice,
+        "rate": system_rate,
+        "sample_rate": NARRATION_SAMPLE_RATE,
+        "fallback": backend == "auto",
+    }
 
 
 def media_duration(path: Path) -> float:
@@ -336,8 +592,8 @@ def write_narration(
         channels = first.getnchannels()
         sample_width = first.getsampwidth()
         rate = first.getframerate()
-    if channels != 1 or sample_width != 2:
-        raise RuntimeError("Expected mono 16-bit System.Speech WAV output")
+    if channels != 1 or sample_width != 2 or rate != NARRATION_SAMPLE_RATE:
+        raise RuntimeError("Expected canonical mono 24 kHz 16-bit PCM narration WAV")
     samples = array("h", [0]) * math.ceil(duration * rate)
     for start, path in chunks:
         with wave.open(str(path), "rb") as stream:
@@ -377,12 +633,60 @@ def schedule_narration(
     return scheduled
 
 
-def main() -> int:
+def _edge_rate(value: str) -> str:
+    match = re.fullmatch(r"([+-])(\d{1,3})%", value)
+    if match is None or int(match.group(2)) > 100:
+        raise argparse.ArgumentTypeError("edge rate must use +N% or -N% within 0..100")
+    return value
+
+
+def _system_rate(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("system rate must be an integer") from exc
+    if not -10 <= parsed <= 10:
+        raise argparse.ArgumentTypeError("system rate must be between -10 and 10")
+    return parsed
+
+
+def _voice_name(value: str) -> str:
+    parsed = value.strip()
+    if not parsed:
+        raise argparse.ArgumentTypeError("voice name cannot be empty")
+    return parsed
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", default=".demo/gui-video-run1")
     parser.add_argument("--output", default=".demo/gui-video-run1/TinyForge-GUI-demo.mp4")
     parser.add_argument("--max-gui-seconds", type=float, default=115.0)
-    args = parser.parse_args()
+    parser.add_argument(
+        "--tts-backend",
+        choices=("auto", "edge", "system"),
+        default="auto",
+        help="Narration backend; auto uses Edge neural TTS with an offline fallback",
+    )
+    parser.add_argument("--edge-voice", type=_voice_name, default=DEFAULT_EDGE_VOICE)
+    parser.add_argument("--edge-rate", type=_edge_rate, default=DEFAULT_EDGE_RATE)
+    parser.add_argument("--system-voice", type=_voice_name, default=DEFAULT_SYSTEM_VOICE)
+    parser.add_argument("--system-rate", type=_system_rate, default=DEFAULT_SYSTEM_RATE)
+    proxy_group = parser.add_mutually_exclusive_group()
+    proxy_group.add_argument(
+        "--tts-proxy",
+        help="HTTP proxy for Edge TTS; defaults to proxy environment or Windows settings",
+    )
+    proxy_group.add_argument(
+        "--no-tts-proxy",
+        action="store_true",
+        help="Ignore proxy environment and Windows settings for Edge TTS",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
 
     input_dir = (ROOT / args.input).resolve()
     output = (ROOT / args.output).resolve()
@@ -465,11 +769,20 @@ def main() -> int:
             "本次运行完整通过：只修改目标实现，四项测试全过，并成功提交可复用记忆。",
         ),
     ]
-    desired_chunks: list[tuple[float, Path]] = []
-    for index, (start, text) in enumerate(narration_items):
-        path = work / f"narration-{index:02d}.wav"
-        synthesize(text, path)
-        desired_chunks.append((start, path))
+    narration_paths, tts_manifest = synthesize_narration(
+        [text for _, text in narration_items],
+        work,
+        backend=args.tts_backend,
+        edge_voice=args.edge_voice,
+        edge_rate=args.edge_rate,
+        system_voice=args.system_voice,
+        system_rate=args.system_rate,
+        proxy=resolve_tts_proxy(args.tts_proxy, args.no_tts_proxy),
+    )
+    desired_chunks = [
+        (start, path)
+        for (start, _), path in zip(narration_items, narration_paths, strict=True)
+    ]
     wav_chunks = schedule_narration(desired_chunks, total_duration)
     narration = work / "narration.wav"
     write_narration(wav_chunks, total_duration, narration)
@@ -581,6 +894,7 @@ def main() -> int:
         "gui_height": gui_height,
         "resolution": f"{WIDTH}x{HEIGHT}",
         "fps": FPS,
+        "tts": tts_manifest,
         "narration": [
             {"start": round(start, 3), "duration": round(wav_duration(path), 3)}
             for start, path in wav_chunks

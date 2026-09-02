@@ -24,7 +24,10 @@ MAX_UI_EVENT_ITEMS = 500
 MAX_UI_EVENT_DEPTH = 8
 MAX_UI_KEY_CHARS = 200
 MAX_DIFF_BYTES = 300_000
+MAX_UI_STREAM_LINE = MAX_UI_TEXT
 _TRUNCATED = "[TRUNCATED]"
+_OMITTED_STREAM_LINE = "[output line omitted: exceeds display limit]\n"
+_OMITTED_BUSY_OUTPUT = "[output omitted: GUI queue was busy]\n"
 _SENSITIVE_NAMES = {
     ".env",
     ".netrc",
@@ -85,6 +88,17 @@ def _redact_and_clip(value: str, limit: int = MAX_UI_TEXT) -> str:
         if 0 <= start < limit < start + len(marker):
             return safe_value[: limit - len(marker)] + marker
     return safe_value[:limit]
+
+
+def _redact_and_clip_command(value: str, limit: int = MAX_UI_TEXT) -> str:
+    safe_value = redact_secrets(value)
+    if len(safe_value) <= limit:
+        return safe_value
+    marker = "\n[command truncated]\n"
+    available = max(0, limit - len(marker))
+    head = available * 2 // 3
+    tail = available - head
+    return safe_value[:head] + marker + (safe_value[-tail:] if tail else "")
 
 
 def _is_sensitive_ui_key(key: str) -> bool:
@@ -167,6 +181,15 @@ def sanitize_agent_event(event: AgentEvent) -> AgentEvent:
     safe_data = _safe_ui_value(event.data)
     if not isinstance(safe_data, dict):
         safe_data = {"value": safe_data}
+    if event.kind == "tool_start" and event.data.get("name") == "run_command":
+        raw_arguments = event.data.get("arguments")
+        safe_arguments = safe_data.get("arguments")
+        if isinstance(raw_arguments, dict) and isinstance(safe_arguments, dict):
+            command = raw_arguments.get("command")
+            if isinstance(command, str):
+                safe_arguments = dict(safe_arguments)
+                safe_arguments["command"] = _redact_and_clip_command(command)
+                safe_data["arguments"] = safe_arguments
     return AgentEvent(kind=_redact_and_clip(str(event.kind), 100), data=safe_data)
 
 
@@ -199,6 +222,43 @@ def summarize_tool_output(output: str) -> tuple[bool, str]:
     return True, "Completed"
 
 
+def command_terminal_result(output: str) -> dict[str, Any]:
+    """Extract a bounded, redacted command result for the read-only terminal."""
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        return {"parsed": False, "error": "Command result is not valid JSON"}
+    if not isinstance(payload, dict):
+        return {"parsed": False, "error": "Command result is not an object"}
+    if not payload.get("ok"):
+        error = str(payload.get("error", "Unknown command error"))
+        if error.startswith("Command timed out after ") and ". Partial stdout:" in error:
+            error = error.split(". Partial stdout:", 1)[0] + "."
+        terminal_error = {
+            "parsed": True,
+            "ok": False,
+            "error": _redact_and_clip(error),
+        }
+        if payload.get("cancelled") is True:
+            terminal_error["cancelled"] = True
+        return terminal_error
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return {"parsed": False, "error": "Command result has no structured payload"}
+    budget = _UiBudget(items=20, chars=MAX_UI_TEXT * 2)
+    terminal_result: dict[str, Any] = {
+        "parsed": True,
+        "ok": True,
+        "stdout": _budgeted_ui_text(str(result.get("stdout", "")), budget),
+        "stderr": _budgeted_ui_text(str(result.get("stderr", "")), budget),
+        "truncated": bool(result.get("truncated", False)),
+    }
+    exit_code = result.get("exit_code")
+    if type(exit_code) is int:
+        terminal_result["exit_code"] = exit_code
+    return terminal_result
+
+
 def _is_sensitive_path(path: Path) -> bool:
     lowered_parts = {part.casefold() for part in path.parts}
     name = path.name.casefold()
@@ -219,7 +279,7 @@ def snapshot_text_file(workspace: Path, relative_path: str) -> FileSnapshot | No
     try:
         root = workspace.resolve()
         requested = Path(relative_path)
-        if requested.is_absolute() or _is_sensitive_path(requested):
+        if "\x00" in str(requested) or requested.is_absolute() or _is_sensitive_path(requested):
             return None
         candidate = (root / requested).resolve(strict=False)
         resolved_relative = candidate.relative_to(root)
@@ -274,14 +334,30 @@ class GuiEventBridge:
         self.run_id = run_id
         self.workspace = workspace.resolve()
         self._before_files: dict[str, FileSnapshot] = {}
+        self._terminal_lines: dict[tuple[str, str], str] = {}
+        self._discarding_terminal_lines: set[tuple[str, str]] = set()
+        self._dropped_terminal_streams: set[tuple[str, str]] = set()
 
     def __call__(self, event: AgentEvent) -> None:
+        raw_call_id = str(event.data.get("call_id", ""))
+        if event.kind == "tool_start" and event.data.get("name") == "run_command":
+            self._clear_terminal_lines(raw_call_id)
+        if event.kind == "tool_output" and event.data.get("name") == "run_command":
+            self._queue_terminal_output(event)
+            return
+        if event.kind == "tool_end" and event.data.get("name") == "run_command":
+            self._finish_terminal_output(raw_call_id)
+
         safe_event = sanitize_agent_event(event)
         if event.kind == "tool_end":
             ok, summary = summarize_tool_output(str(event.data.get("output", "")))
             safe_data = dict(safe_event.data)
             safe_data["output_ok"] = ok
             safe_data["output_summary"] = summary
+            if event.data.get("name") == "run_command":
+                safe_data["terminal_result"] = command_terminal_result(
+                    str(event.data.get("output", ""))
+                )
             safe_event = AgentEvent(kind=safe_event.kind, data=safe_data)
         call_id = str(safe_event.data.get("call_id", ""))
         if safe_event.kind == "tool_start" and safe_event.data.get("name") in {
@@ -309,6 +385,116 @@ class GuiEventBridge:
                             {"path": before.relative_path, "diff": diff},
                         )
                     )
+
+    def _queue_terminal_output(self, event: AgentEvent) -> None:
+        call_id = str(event.data.get("call_id", ""))
+        stream = str(event.data.get("stream", ""))
+        if not call_id or stream not in {"stdout", "stderr"}:
+            return
+        key = (call_id, stream)
+        if key in self._dropped_terminal_streams:
+            return
+        value = str(event.data.get("text", ""))
+        if key in self._discarding_terminal_lines:
+            newline = value.find("\n")
+            if newline < 0:
+                return
+            self._discarding_terminal_lines.discard(key)
+            value = value[newline + 1 :]
+        buffered = self._terminal_lines.pop(key, "") + value
+        parts = buffered.split("\n")
+        complete_lines = [part + "\n" for part in parts[:-1]]
+        remainder = "" if buffered.endswith("\n") else parts[-1]
+        if remainder:
+            if len(remainder) > MAX_UI_STREAM_LINE:
+                complete_lines.append(_OMITTED_STREAM_LINE)
+                self._discarding_terminal_lines.add(key)
+            else:
+                self._terminal_lines[key] = remainder
+
+        batch: list[str] = []
+        batch_chars = 0
+        for line in complete_lines:
+            if len(line) > MAX_UI_STREAM_LINE:
+                line = _OMITTED_STREAM_LINE
+            if batch and batch_chars + len(line) > MAX_UI_TEXT:
+                if not self._put_terminal_output(call_id, stream, "".join(batch)):
+                    self._drop_terminal_stream(key)
+                    return
+                batch = []
+                batch_chars = 0
+            batch.append(line)
+            batch_chars += len(line)
+        if batch and not self._put_terminal_output(call_id, stream, "".join(batch)):
+            self._drop_terminal_stream(key)
+
+    def _finish_terminal_output(self, call_id: str) -> None:
+        self._flush_terminal_lines(call_id)
+        dropped = sorted(key for key in self._dropped_terminal_streams if key[0] == call_id)
+        for _, stream in dropped:
+            self._put_terminal_output(
+                call_id,
+                stream,
+                _OMITTED_BUSY_OUTPUT,
+                block=True,
+            )
+        self._clear_terminal_lines(call_id)
+
+    def _flush_terminal_lines(self, call_id: str) -> None:
+        keys = [key for key in self._terminal_lines if key[0] == call_id]
+        for key in keys:
+            value = self._terminal_lines.pop(key)
+            if (
+                value
+                and key not in self._dropped_terminal_streams
+                and not self._put_terminal_output(key[0], key[1], value)
+            ):
+                self._drop_terminal_stream(key)
+
+    def _drop_terminal_stream(self, key: tuple[str, str]) -> None:
+        self._terminal_lines.pop(key, None)
+        self._discarding_terminal_lines.discard(key)
+        self._dropped_terminal_streams.add(key)
+
+    def _clear_terminal_lines(self, call_id: str) -> None:
+        for key in tuple(self._terminal_lines):
+            if key[0] == call_id:
+                self._terminal_lines.pop(key, None)
+        self._discarding_terminal_lines = {
+            key for key in self._discarding_terminal_lines if key[0] != call_id
+        }
+        self._dropped_terminal_streams = {
+            key for key in self._dropped_terminal_streams if key[0] != call_id
+        }
+
+    def _put_terminal_output(
+        self,
+        call_id: str,
+        stream: str,
+        value: str,
+        *,
+        block: bool = False,
+    ) -> bool:
+        safe_event = sanitize_agent_event(
+            AgentEvent(
+                "tool_output",
+                {
+                    "call_id": call_id,
+                    "name": "run_command",
+                    "stream": stream,
+                    "text": value,
+                },
+            )
+        )
+        envelope = UiEnvelope(self.run_id, "event", safe_event)
+        if block:
+            self.target.put(envelope)
+            return True
+        try:
+            self.target.put_nowait(envelope)
+        except queue.Full:
+            return False
+        return True
 
 
 AgentBuilder = Callable[[Config, Callable[[AgentEvent], None]], Agent]
