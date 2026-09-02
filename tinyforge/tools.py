@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import codecs
 import fnmatch
 import inspect
@@ -950,13 +951,25 @@ class WorkspaceTools:
 
         limit = min(max(int(timeout or self.command_timeout), 1), 600)
         if os.name == "nt":
+            encoded_command = base64.b64encode(command.encode("utf-8")).decode("ascii")
+            powershell_wrapper = (
+                "[Console]::InputEncoding = [Text.UTF8Encoding]::new($false); "
+                "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); "
+                "$OutputEncoding = [Console]::OutputEncoding; "
+                "$global:LASTEXITCODE = 0; "
+                "$tinyforgeCommand = [Text.Encoding]::UTF8.GetString("
+                f"[Convert]::FromBase64String('{encoded_command}')); "
+                "Invoke-Expression $tinyforgeCommand; "
+                "$tinyforgeSucceeded = $?; $tinyforgeExitCode = $LASTEXITCODE; "
+                "if (-not $tinyforgeSucceeded -or $tinyforgeExitCode -ne 0) { exit 1 }"
+            )
             invocation = [
                 "powershell.exe",
                 "-NoLogo",
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                command,
+                powershell_wrapper,
             ]
             suspended_flag = getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
             creation_flags = (

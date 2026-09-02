@@ -72,6 +72,25 @@ class WorkspaceToolsTests(unittest.TestCase):
         self.assertEqual(result["result"]["exit_code"], 0)
         self.assertIn("42", result["result"]["stdout"])
 
+    @unittest.skipUnless(os.name == "nt", "PowerShell UTF-8 behavior is Windows-only")
+    def test_powershell_output_and_parser_errors_are_utf8(self) -> None:
+        output = self.execute(
+            "run_command",
+            command=(
+                "[Console]::Out.WriteLine('标准输出中文'); "
+                "[Console]::Error.WriteLine('错误输出中文')"
+            ),
+        )
+        self.assertEqual(output["result"]["exit_code"], 0)
+        self.assertIn("标准输出中文", output["result"]["stdout"])
+        self.assertIn("错误输出中文", output["result"]["stderr"])
+        self.assertNotIn("\ufffd", output["result"]["stdout"] + output["result"]["stderr"])
+
+        parser_error = self.execute("run_command", command="apply_patch <<'PATCH'")
+        self.assertNotEqual(parser_error["result"]["exit_code"], 0)
+        self.assertIn("MissingFileSpecification", parser_error["result"]["stderr"])
+        self.assertNotIn("\ufffd", parser_error["result"]["stderr"])
+
     def test_command_does_not_inherit_agent_provider_credentials(self) -> None:
         (self.root / "inspect_environment.py").write_text(
             "import os\n"

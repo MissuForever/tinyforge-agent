@@ -146,6 +146,11 @@ Stay inside the workspace. Avoid destructive commands and unrelated changes. Whe
 with a concise summary of changes and verification. Start a successful final response with exactly
 TASK_COMPLETE:. If blocked or incomplete, start it with exactly TASK_BLOCKED: and state the blocker
 and evidence. Do not use either marker in an intermediate response that contains tool calls.
+    """
+    if platform.system() == "Windows":
+        prompt += """
+run_command uses Windows PowerShell. Do not use Bash heredocs such as <<'EOF' and do not call an
+unavailable apply_patch executable. Use edit_file or write_file for repository changes.
 """
     if memory_enabled:
         prompt += """

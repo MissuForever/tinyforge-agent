@@ -71,7 +71,8 @@ python scripts/record_gui_demo.py --output .demo/gui-video-primary-fullscreen --
    测试，并使用 `stage_memory` 保存带验证证据的 SOP。
 5. 在中间区域同步展示执行时间线，以及下方独立的命令、输出和退出状态。
 6. Agent 结束后依次回看最终 Result、失败测试、统一 Diff、左侧 Workspace 中的 Git 修改
-   状态和 `pricing.py` 只读预览、成功测试、持久记忆及 Skill 检索和 receipt。
+   状态和 `pricing.py` 只读预览，再切换 History 展示可恢复会话，最后查看成功测试、持久记忆
+   及 Skill 检索和 receipt。
 7. 在 GUI 关闭后独立复跑 4 项测试，并检查只改动了 `pricing.py`。
 
 录制成功时，终端最后输出的 JSON 必须包含：

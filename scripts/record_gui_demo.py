@@ -428,14 +428,15 @@ class DemoController:
             return
         self._showcase_started = True
         stages: list[tuple[str, Callable[[], None], int]] = [
-            ("result_live", self._show_result, 4_000),
-            ("baseline_evidence", self._show_failed_test, 5_500),
-            ("code_changes", self._show_changes, 6_500),
-            ("workspace_files", self._show_files, 6_500),
-            ("verification_evidence", self._show_passed_test, 5_500),
-            ("persistent_memory", self._show_memory, 6_500),
-            ("skill_receipt", self._show_skills, 6_500),
-            ("final_result", self._show_result, 5_000),
+            ("result_live", self._show_result, 3_500),
+            ("baseline_evidence", self._show_failed_test, 5_000),
+            ("code_changes", self._show_changes, 6_000),
+            ("workspace_files", self._show_files, 6_000),
+            ("conversation_history", self._show_history, 5_000),
+            ("verification_evidence", self._show_passed_test, 5_000),
+            ("persistent_memory", self._show_memory, 6_000),
+            ("skill_receipt", self._show_skills, 6_000),
+            ("final_result", self._show_result, 4_500),
         ]
 
         def advance(index: int) -> None:
@@ -453,7 +454,7 @@ class DemoController:
             self.mark(name)
             self._after(duration, advance, index + 1)
 
-        self._after(2_000, advance, 0)
+        self._after(1_000, advance, 0)
 
     def _select_timeline(self, *, state: str | None, action: str, last: bool) -> bool:
         items = [
@@ -530,9 +531,22 @@ class DemoController:
 
     def _show_files(self) -> None:
         self.app.main_splitter.setSizes([310, 370, 288])
+        self.app.workspace_tabs.setCurrentIndex(0)
         self.app.files_splitter.setSizes([125, 165])
         self.app.file_search_entry.clear()
         self.app._request_files_refresh("pricing.py", delay_ms=0)
+
+    def _show_history(self) -> None:
+        self.app.workspace_tabs.setCurrentIndex(1)
+        self.app._refresh_history()
+        count = self.app.history_tree.topLevelItemCount()
+        if count:
+            item = self.app.history_tree.topLevelItem(0)
+            self.app.history_tree.setCurrentItem(item)
+            self.app.history_tree.scrollToItem(
+                item,
+                QAbstractItemView.ScrollHint.PositionAtCenter,
+            )
 
     def _wait_for_files_showcase(
         self,
@@ -743,7 +757,7 @@ def main() -> int:
     os.environ.update(
         {
             "TINYFORGE_STATE_DIR": str(output / "state"),
-            "TINYFORGE_ARCHIVE_SESSIONS": "0",
+            "TINYFORGE_ARCHIVE_SESSIONS": "1",
             "TINYFORGE_SKILLS_ENABLED": "1",
             "TINYFORGE_MAX_ROUNDS": "20",
             "PYTHONIOENCODING": "utf-8",
@@ -811,6 +825,11 @@ def main() -> int:
         "preview_ready": "order_total" in app.file_preview_text.toPlainText(),
         "git_status": pricing_entry.git_status if pricing_entry is not None else "",
     }
+    history_showcase = {
+        "visible": app.workspace_tabs.currentIndex() == 1,
+        "count": app.history_tree.topLevelItemCount(),
+        "selected": bool(app.history_tree.selectedItems()),
+    }
     loaded_skills = [dict(item) for item in app._loaded_skills]
     skill_showcase = {
         "enabled": app._skill_enabled,
@@ -866,6 +885,9 @@ def main() -> int:
     files_marker_recorded = any(
         marker.get("name") == "workspace_files" for marker in controller.markers
     )
+    history_marker_recorded = any(
+        marker.get("name") == "conversation_history" for marker in controller.markers
+    )
     skill_marker_recorded = any(
         marker.get("name") == "skill_receipt" for marker in controller.markers
     )
@@ -900,7 +922,9 @@ def main() -> int:
         "gui_test_evidence": gui_test_evidence,
         "command_showcase": command_showcase,
         "files_showcase": files_showcase,
+        "history_showcase": history_showcase,
         "files_marker_recorded": files_marker_recorded,
+        "history_marker_recorded": history_marker_recorded,
         "skill_showcase": skill_showcase,
         "skill_marker_recorded": skill_marker_recorded,
         "changed_files": changed_files,
@@ -944,6 +968,10 @@ def main() -> int:
         and files_showcase["preview_ready"]
         and "M" in files_showcase["git_status"]
         and files_marker_recorded
+        and history_showcase["visible"]
+        and history_showcase["count"] >= 1
+        and history_showcase["selected"]
+        and history_marker_recorded
         and skill_showcase["enabled"]
         and skill_showcase["search_count"] >= 1
         and "workspace:verified-bugfix" in skill_showcase["loaded"]
@@ -963,6 +991,7 @@ def main() -> int:
                 "changed_files": changed_files,
                 "command_showcase": command_showcase,
                 "files_showcase": files_showcase,
+                "history_showcase": history_showcase,
                 "skill_showcase": skill_showcase,
                 "memory_commits": memory_commit_count,
                 "raw_video": str(output / "gui-raw.mp4"),

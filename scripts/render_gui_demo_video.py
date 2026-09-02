@@ -107,12 +107,6 @@ def make_intro(path: Path, result: dict[str, Any]) -> None:
         font=font(MONO, 25),
         fill=YELLOW,
     )
-    draw.text(
-        (72, 958),
-        "录屏来自一次全新的实时运行；网络等待会在成片中等比加速。",
-        font=font(SANS, 23),
-        fill=MUTED,
-    )
     image.save(path, optimize=True)
 
 
@@ -737,6 +731,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         and result.get("files_showcase", {}).get("preview_ready")
         and "M" in str(result.get("files_showcase", {}).get("git_status", ""))
         and result.get("files_marker_recorded")
+        and result.get("history_showcase", {}).get("visible")
+        and result.get("history_showcase", {}).get("count", 0) >= 1
+        and result.get("history_marker_recorded")
         and (
             result.get("configuration", {}).get("skills_enabled") is not True
             or (
@@ -813,6 +810,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         (
             live_time(marker_time(result, "workspace_files", terminal + 18.0)) + 0.5,
             "左侧工作区同步显示目录结构和 Git 状态。pricing 点 py 标记为已修改，文件树下方可直接查看带行号的安全只读预览。",
+        ),
+        (
+            live_time(marker_time(result, "conversation_history", terminal + 24.0)) + 0.4,
+            "切换到历史标签，可以查看按工作区隔离保存的会话，并继续、重命名或删除已有对话。",
         ),
         (
             live_time(marker_time(result, "skill_receipt", terminal + 36.0)) + 0.4,

@@ -25,6 +25,9 @@ PySide6 放在 `gui` 可选依赖组，核心 Runtime 和 CLI 因此仍保持零
    编码成 JSON，使用相同的 `tool_call_id` 回填历史。
 6. Agent 携带新历史再次调用模型，使模型能够观察结果并决定下一步。
 
+Windows 命令在 UTF-8 PowerShell 包装层中延迟解析，标准输出、错误输出和本地化语法错误
+统一按 UTF-8 回传，同时保留非零退出状态。这样中文诊断不会因系统代码页不同而显示乱码。
+
 内部历史统一使用 Chat 风格，协议适配器在 HTTP 边界转换：Chat Completions 使用嵌套的
 `function` 工具定义和 `tool` 消息；Responses API 使用扁平工具定义，并把调用与结果转换为
 共享 `call_id` 的 `function_call` 和 `function_call_output`。这样 Agent 循环不依赖厂商协议。
