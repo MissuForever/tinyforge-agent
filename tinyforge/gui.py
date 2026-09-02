@@ -8,8 +8,9 @@ import os
 import queue
 import re
 import sys
+import threading
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Sequence
 
 from PySide6.QtCore import Qt, QTimer
@@ -56,6 +57,13 @@ from .agent import AgentEvent, AgentResult
 from .config import Config, ConfigError
 from .gui_support import AgentWorker, UiEnvelope, summarize_tool_output
 from .memory import redact_secrets
+from .workspace_view import (
+    WorkspaceFile,
+    WorkspaceFilePreview,
+    WorkspaceIndex,
+    preview_workspace_file,
+    scan_workspace,
+)
 
 
 class DiffHighlighter(QSyntaxHighlighter):
@@ -166,6 +174,15 @@ class _TerminalCommandState:
     discarding: set[str] = field(default_factory=set)
 
 
+@dataclass(frozen=True, slots=True)
+class _FileTreeNode:
+    relative_path: str
+    name: str
+    is_directory: bool
+    git_status: str = ""
+    is_link: bool = False
+
+
 class TinyForgeApp(QMainWindow):
     """A focused, auditable desktop workbench for the TinyForge runtime."""
 
@@ -174,6 +191,10 @@ class TinyForgeApp(QMainWindow):
     MAX_TERMINAL_CHARS = 200_000
     TERMINAL_TRIM_CHARS = 160_000
     MAX_TERMINAL_CHUNK_CHARS = 40_000
+    MAX_FILE_SEARCH_RESULTS = 500
+    FILE_PATH_ROLE = int(Qt.ItemDataRole.UserRole)
+    FILE_KIND_ROLE = FILE_PATH_ROLE + 1
+    FILE_LOADED_ROLE = FILE_PATH_ROLE + 2
     ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
     CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
     BIDI_CONTROL_RE = re.compile(r"[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
@@ -247,6 +268,52 @@ class TinyForgeApp(QMainWindow):
         self._terminal_command_count = 0
         self._terminal_auto_opened = False
         self._terminal_workspace = initial_workspace
+        self._files_workspace = initial_workspace
+        self._file_index: WorkspaceIndex | None = None
+        self._file_nodes: dict[str, tuple[_FileTreeNode, ...]] = {}
+        self._file_entries: dict[str, WorkspaceFile] = {}
+        self._file_items: dict[str, QTreeWidgetItem] = {}
+        self._file_expanded_paths: set[str] = {""}
+        self._selected_file_path: str | None = None
+        self._file_tool_paths: dict[str, str] = {}
+        self._file_generation = 0
+        self._file_preview_generation = 0
+        self._file_selection_revision = 0
+        self._pending_file_selection: str | None = None
+        self._pending_file_selection_revision: int | None = None
+        self._file_workers_stopped = False
+        self._file_index_requests: queue.Queue[
+            tuple[int, Path, str | None, int] | None
+        ] = queue.Queue(maxsize=1)
+        self._file_index_queue: queue.Queue[
+            tuple[int, Path, WorkspaceIndex, str | None, int]
+        ] = queue.Queue(maxsize=1)
+        self._file_preview_requests: queue.Queue[
+            tuple[int, Path, str] | None
+        ] = queue.Queue(maxsize=1)
+        self._file_preview_queue: queue.Queue[
+            tuple[int, Path, WorkspaceFilePreview]
+        ] = queue.Queue(maxsize=1)
+        self._file_index_worker = threading.Thread(
+            target=self._file_index_worker_loop,
+            name="tinyforge-files-worker",
+            daemon=True,
+        )
+        self._file_preview_worker = threading.Thread(
+            target=self._file_preview_worker_loop,
+            name="tinyforge-preview-worker",
+            daemon=True,
+        )
+        self._file_index_worker.start()
+        self._file_preview_worker.start()
+
+        self._file_refresh_timer = QTimer(self)
+        self._file_refresh_timer.setSingleShot(True)
+        self._file_refresh_timer.timeout.connect(self._refresh_files)
+        self._file_filter_timer = QTimer(self)
+        self._file_filter_timer.setSingleShot(True)
+        self._file_filter_timer.setInterval(180)
+        self._file_filter_timer.timeout.connect(self._apply_file_filter)
 
         self.event_queue: queue.Queue[UiEnvelope] = queue.Queue(maxsize=2_000)
         self.worker = AgentWorker(self.event_queue)
@@ -261,6 +328,7 @@ class TinyForgeApp(QMainWindow):
         self._set_memory_text("Memory has not been loaded for this workspace.")
         self._set_details_text("Select an execution step to inspect its evidence.")
         self._set_changes_text("No file changes captured.")
+        self._reset_files(initial_workspace)
         self._set_status("Ready", "neutral")
         self._set_stats("No task has run in this session")
 
@@ -358,6 +426,19 @@ class TinyForgeApp(QMainWindow):
                 background: #111517; color: #d6dfdc; border: 0; border-radius: 0;
                 font-family: "Cascadia Mono", Consolas; font-size: 9.5pt;
                 selection-background-color: #315c66; selection-color: #ffffff;
+            }}
+            QWidget#FilesToolbar {{
+                background: #ffffff; border-bottom: 1px solid {self.COLORS['border']};
+            }}
+            QTreeWidget#FilesTree::item {{ height: 28px; border-bottom: 0; }}
+            QLabel#FilePath {{
+                color: #293239; font-family: "Cascadia Mono", Consolas;
+                font-size: 9pt; font-weight: 600;
+            }}
+            QPlainTextEdit#FilePreview {{
+                background: #fbfcfc; border: 0; border-top: 1px solid {self.COLORS['border']};
+                border-radius: 0; font-family: "Cascadia Mono", Consolas;
+                font-size: 9pt; color: #263238;
             }}
             QFrame#Composer {{ background: {self.COLORS['panel']}; border-top: 1px solid {self.COLORS['border']}; }}
             QLabel#ShortcutHint {{ color: #7a858b; font-size: 8.5pt; }}
@@ -570,8 +651,96 @@ class TinyForgeApp(QMainWindow):
         self.inspector.addTab(self.changes_text, "Changes")
         self.inspector.addTab(self.memory_text, "Memory")
         self.inspector.addTab(self.terminal_text, "Terminal")
+        self.inspector.addTab(self._build_files_tab(), "Files")
         layout.addWidget(self.inspector)
         return panel
+
+    def _build_files_tab(self) -> QWidget:
+        tab = QWidget()
+        tab.setObjectName("FilesTab")
+        self.files_tab = tab
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        toolbar = QWidget()
+        toolbar.setObjectName("FilesToolbar")
+        toolbar_layout = QHBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(10, 7, 10, 7)
+        toolbar_layout.setSpacing(8)
+        self.file_search_entry = QLineEdit()
+        self.file_search_entry.setPlaceholderText("Filter files")
+        self.file_search_entry.setClearButtonEnabled(True)
+        self.file_search_entry.setAccessibleName("Filter workspace files")
+        self.file_search_entry.textChanged.connect(self._schedule_file_filter)
+        self.file_count_label = QLabel("0 files")
+        self.file_count_label.setObjectName("PanelMeta")
+        self.file_refresh_button = QPushButton()
+        self.file_refresh_button.setObjectName("IconButton")
+        self.file_refresh_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload)
+        )
+        self.file_refresh_button.setToolTip("Refresh workspace files")
+        self.file_refresh_button.setAccessibleName("Refresh workspace files")
+        self.file_refresh_button.clicked.connect(self._refresh_files)
+        toolbar_layout.addWidget(self.file_search_entry, 1)
+        toolbar_layout.addWidget(self.file_count_label)
+        toolbar_layout.addWidget(self.file_refresh_button)
+        layout.addWidget(toolbar)
+
+        self.files_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.files_splitter.setChildrenCollapsible(False)
+        self.file_tree = QTreeWidget()
+        self.file_tree.setObjectName("FilesTree")
+        self.file_tree.setColumnCount(2)
+        self.file_tree.setHeaderLabels(["NAME", "GIT"])
+        self.file_tree.setRootIsDecorated(True)
+        self.file_tree.setUniformRowHeights(True)
+        self.file_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.file_tree.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.file_tree.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.file_tree.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.file_tree.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.file_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.file_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.file_tree.setColumnWidth(1, 48)
+        self.file_tree.itemExpanded.connect(self._on_file_item_expanded)
+        self.file_tree.itemCollapsed.connect(self._on_file_item_collapsed)
+        self.file_tree.itemSelectionChanged.connect(self._on_file_tree_select)
+
+        preview = QWidget()
+        preview_layout = QVBoxLayout(preview)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setSpacing(0)
+        preview_header = QWidget()
+        preview_header_layout = QHBoxLayout(preview_header)
+        preview_header_layout.setContentsMargins(10, 7, 10, 7)
+        preview_header_layout.setSpacing(8)
+        self.file_preview_path = QLabel("Select a file")
+        self.file_preview_path.setObjectName("FilePath")
+        self.file_preview_path.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.file_preview_meta = QLabel("")
+        self.file_preview_meta.setObjectName("PanelMeta")
+        preview_header_layout.addWidget(self.file_preview_path, 1)
+        preview_header_layout.addWidget(self.file_preview_meta)
+        self.file_preview_text = QPlainTextEdit()
+        self.file_preview_text.setObjectName("FilePreview")
+        self.file_preview_text.setReadOnly(True)
+        self.file_preview_text.setUndoRedoEnabled(False)
+        self.file_preview_text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.file_preview_text.setPlainText("Select a file to preview.")
+        preview_layout.addWidget(preview_header)
+        preview_layout.addWidget(self.file_preview_text, 1)
+
+        self.files_splitter.addWidget(self.file_tree)
+        self.files_splitter.addWidget(preview)
+        self.files_splitter.setStretchFactor(0, 3)
+        self.files_splitter.setStretchFactor(1, 2)
+        self.files_splitter.setSizes([260, 190])
+        layout.addWidget(self.files_splitter, 1)
+        return tab
 
     def _build_composer(self) -> QWidget:
         panel = QFrame()
@@ -650,6 +819,8 @@ class TinyForgeApp(QMainWindow):
             self._has_session = False
             self._set_memory_text("Memory has not been loaded for this workspace.")
             self._reset_terminal(workspace)
+        if workspace != self._files_workspace:
+            self._reset_files(workspace)
         if self._settings_dirty:
             return
         if workspace == self._settings_workspace:
@@ -677,6 +848,7 @@ class TinyForgeApp(QMainWindow):
             self._has_session = False
             self._set_memory_text("Memory has not been loaded for this workspace.")
             self._reset_terminal(workspace)
+            self._reset_files(workspace)
 
     def _new_session(self) -> None:
         if not self.worker.reset():
@@ -704,6 +876,7 @@ class TinyForgeApp(QMainWindow):
         self._set_details_text("Select an execution step to inspect its evidence.")
         self._set_changes_text("No file changes captured.")
         self._refresh_memory()
+        self._request_files_refresh(delay_ms=0)
         self._set_status("Ready", "neutral")
         self._set_stats("New session")
         self.task_input.setFocus()
@@ -756,6 +929,8 @@ class TinyForgeApp(QMainWindow):
         self.current_run_id = run_id
         if workspace != self._terminal_workspace:
             self._reset_terminal(workspace)
+        if workspace != self._files_workspace:
+            self._reset_files(workspace)
         self.model_entry.setText(config.model)
         self.protocol_combo.setCurrentText(config.wire_api)
         safe_task = redact_secrets(task)
@@ -820,6 +995,7 @@ class TinyForgeApp(QMainWindow):
                     self.worker.acknowledge_terminal(envelope.run_id)
                 continue
             self._handle_envelope(envelope)
+        self._drain_file_queues()
 
     def _handle_envelope(self, envelope: UiEnvelope) -> None:
         if envelope.kind == "event" and isinstance(envelope.payload, AgentEvent):
@@ -884,6 +1060,10 @@ class TinyForgeApp(QMainWindow):
             self._active_items.add(item)
             if name == "run_command":
                 self._start_terminal_command(call_id, arguments)
+            elif name in {"edit_file", "write_file"} and isinstance(arguments, dict):
+                path = arguments.get("path")
+                if isinstance(path, str) and path:
+                    self._file_tool_paths[call_id] = path
         elif event.kind == "tool_output":
             call_id = str(data.get("call_id", ""))
             name = str(data.get("name", ""))
@@ -934,6 +1114,11 @@ class TinyForgeApp(QMainWindow):
                 )
             if name == "run_command":
                 self._finish_terminal_command(call_id, data)
+            target_path = self._file_tool_paths.pop(call_id, None)
+            if ok and name in {"edit_file", "write_file"}:
+                self._request_files_refresh(target_path)
+            elif name == "run_command":
+                self._request_files_refresh(delay_ms=250)
         elif event.kind == "context_compacted":
             removed = int(data.get("removed", 0))
             self._insert_timeline(
@@ -996,6 +1181,7 @@ class TinyForgeApp(QMainWindow):
         self._has_session = True
         self._set_running(False)
         self._refresh_memory()
+        self._request_files_refresh(delay_ms=0)
         self._close_after_terminal_event()
 
     def _finish_error(self, error: str) -> None:
@@ -1009,6 +1195,7 @@ class TinyForgeApp(QMainWindow):
         self._has_session = True
         self._set_running(False)
         self._refresh_memory()
+        self._request_files_refresh(delay_ms=0)
         self._close_after_terminal_event()
 
     def _show_local_error(self, error: str) -> None:
@@ -1026,6 +1213,595 @@ class TinyForgeApp(QMainWindow):
         except (OSError, TypeError, ValueError) as exc:
             overview = f"Memory could not be loaded: {exc}"
         self._set_memory_text(overview)
+
+    def _reset_files(self, workspace: Path) -> None:
+        try:
+            resolved = workspace.expanduser().resolve(strict=False)
+        except (OSError, ValueError):
+            resolved = workspace
+        self._file_refresh_timer.stop()
+        self._file_filter_timer.stop()
+        self._file_generation += 1
+        self._file_preview_generation += 1
+        self._file_selection_revision += 1
+        self._clear_queue(self._file_preview_requests)
+        self._clear_queue(self._file_preview_queue)
+        self._files_workspace = resolved
+        self._file_index = None
+        self._file_nodes.clear()
+        self._file_entries.clear()
+        self._file_items.clear()
+        self._file_tool_paths.clear()
+        self._file_expanded_paths = {""}
+        self._selected_file_path = None
+        self._pending_file_selection = None
+        self._pending_file_selection_revision = None
+        previous = self.file_search_entry.blockSignals(True)
+        self.file_search_entry.clear()
+        self.file_search_entry.blockSignals(previous)
+        self.file_tree.clear()
+        self.file_count_label.setText("Loading")
+        self.inspector.setTabText(self.inspector.indexOf(self.files_tab), "Files")
+        self._set_file_preview_message("Select a file", "Select a file to preview.")
+        self._start_file_refresh(resolved, None)
+
+    def _request_files_refresh(
+        self,
+        relative_path: str | None = None,
+        *,
+        delay_ms: int = 160,
+    ) -> None:
+        if relative_path:
+            self._pending_file_selection = relative_path.replace("\\", "/")
+            self._pending_file_selection_revision = self._file_selection_revision
+        if delay_ms <= 0:
+            self._file_refresh_timer.stop()
+            self._refresh_files()
+        else:
+            self._file_refresh_timer.start(delay_ms)
+
+    def _refresh_files(self, _checked: bool = False) -> None:
+        self._file_refresh_timer.stop()
+        selection = self._pending_file_selection or self._selected_file_path
+        selection_revision = self._pending_file_selection_revision
+        self._pending_file_selection = None
+        self._pending_file_selection_revision = None
+        self._start_file_refresh(
+            self._files_workspace,
+            selection,
+            selection_revision=selection_revision,
+        )
+
+    def _start_file_refresh(
+        self,
+        workspace: Path,
+        selection: str | None,
+        *,
+        selection_revision: int | None = None,
+    ) -> None:
+        if self._closed or self._file_workers_stopped:
+            return
+        self._file_generation += 1
+        generation = self._file_generation
+        self.file_refresh_button.setEnabled(False)
+        self.file_count_label.setText("Loading")
+        self._offer_latest(
+            self._file_index_requests,
+            (
+                generation,
+                workspace,
+                selection,
+                self._file_selection_revision
+                if selection_revision is None
+                else selection_revision,
+            ),
+        )
+
+    def _file_index_worker_loop(self) -> None:
+        while True:
+            request = self._file_index_requests.get()
+            if request is None:
+                return
+            generation, workspace, selection, selection_revision = request
+            try:
+                index = scan_workspace(workspace)
+            except Exception:
+                index = WorkspaceIndex(
+                    workspace,
+                    (),
+                    error="Workspace files could not be loaded.",
+                )
+            if self._closed:
+                continue
+            self._offer_latest(
+                self._file_index_queue,
+                (generation, workspace, index, selection, selection_revision),
+            )
+
+    @staticmethod
+    def _clear_queue(target: queue.Queue[Any]) -> None:
+        while True:
+            try:
+                target.get_nowait()
+            except queue.Empty:
+                return
+
+    @classmethod
+    def _offer_latest(cls, target: queue.Queue[Any], value: Any) -> None:
+        cls._clear_queue(target)
+        try:
+            target.put_nowait(value)
+        except queue.Full:
+            pass
+
+    def _stop_file_workers(self) -> None:
+        if self._file_workers_stopped:
+            return
+        self._file_workers_stopped = True
+        self._offer_latest(self._file_index_requests, None)
+        self._offer_latest(self._file_preview_requests, None)
+
+    def _drain_file_queues(self) -> None:
+        while True:
+            try:
+                (
+                    generation,
+                    workspace,
+                    index,
+                    selection,
+                    selection_revision,
+                ) = self._file_index_queue.get_nowait()
+            except queue.Empty:
+                break
+            if (
+                generation != self._file_generation
+                or workspace != self._files_workspace
+                or self._closed
+            ):
+                continue
+            self.file_refresh_button.setEnabled(True)
+            latest_selection = (
+                selection
+                if selection_revision == self._file_selection_revision
+                else self._selected_file_path
+            )
+            self._apply_file_index(index, latest_selection)
+
+        while True:
+            try:
+                generation, workspace, preview = self._file_preview_queue.get_nowait()
+            except queue.Empty:
+                break
+            if (
+                generation != self._file_preview_generation
+                or workspace != self._files_workspace
+                or preview.relative_path != self._selected_file_path
+                or self._closed
+            ):
+                continue
+            self._apply_file_preview(preview)
+
+    def _apply_file_index(
+        self,
+        index: WorkspaceIndex,
+        selection: str | None,
+    ) -> None:
+        self._file_preview_generation += 1
+        self._clear_queue(self._file_preview_requests)
+        self._clear_queue(self._file_preview_queue)
+        self._file_index = index
+        self._file_entries = {entry.relative_path: entry for entry in index.files}
+        self._file_nodes = self._build_file_nodes(index.files)
+        total = len(index.files)
+        suffix = "+" if index.truncated else ""
+        self.file_count_label.setText(f"{total}{suffix} files")
+        self.inspector.setTabText(
+            self.inspector.indexOf(self.files_tab),
+            f"Files ({total}{suffix})" if total else "Files",
+        )
+        if index.error:
+            self._selected_file_path = None
+            self._render_file_message(index.error)
+            self._set_file_preview_message("Files unavailable", index.error)
+            return
+        self._render_file_tree(selection=selection)
+
+    def _build_file_nodes(
+        self,
+        entries: tuple[WorkspaceFile, ...],
+    ) -> dict[str, tuple[_FileTreeNode, ...]]:
+        definitions: dict[str, dict[str, tuple[str, bool, str, bool]]] = {}
+        directory_statuses: dict[str, set[str]] = {}
+        for entry in entries:
+            parts = PurePosixPath(entry.relative_path).parts
+            parent = ""
+            for index, name in enumerate(parts):
+                current = "/".join(parts[: index + 1])
+                is_directory = index < len(parts) - 1
+                definitions.setdefault(parent, {})[current] = (
+                    name,
+                    is_directory,
+                    "" if is_directory else entry.git_status,
+                    False if is_directory else entry.is_link,
+                )
+                if is_directory:
+                    definitions.setdefault(current, {})
+                    if entry.git_status:
+                        directory_statuses.setdefault(current, set()).add(
+                            entry.git_status
+                        )
+                parent = current
+
+        nodes: dict[str, tuple[_FileTreeNode, ...]] = {}
+        for parent, children in definitions.items():
+            values = []
+            for relative_path, (name, is_directory, status, is_link) in children.items():
+                if is_directory:
+                    status = self._aggregate_file_status(
+                        directory_statuses.get(relative_path, set())
+                    )
+                values.append(
+                    _FileTreeNode(
+                        relative_path,
+                        name,
+                        is_directory,
+                        status,
+                        is_link,
+                    )
+                )
+            nodes[parent] = tuple(
+                sorted(
+                    values,
+                    key=lambda node: (not node.is_directory, node.name.casefold()),
+                )
+            )
+        return nodes
+
+    @staticmethod
+    def _aggregate_file_status(statuses: set[str]) -> str:
+        joined = "".join(statuses)
+        for marker in ("U", "D", "A", "R", "C", "M", "T", "?"):
+            if marker in joined:
+                return marker
+        return ""
+
+    @staticmethod
+    def _display_file_status(status: str) -> str:
+        if status == "??":
+            return "?"
+        compact = status.replace(" ", "")
+        return compact[:2]
+
+    def _render_file_tree(self, *, selection: str | None = None) -> None:
+        if self.file_search_entry.text().strip():
+            self._apply_file_filter(selection=selection)
+            return
+        scroll_value = self.file_tree.verticalScrollBar().value()
+        old_blocked = self.file_tree.blockSignals(True)
+        try:
+            self.file_tree.clear()
+            self.file_tree.setRootIsDecorated(True)
+            self._file_items.clear()
+            if not self._file_index or not self._file_index.files:
+                self._selected_file_path = None
+                self._add_file_message_item("No visible files")
+                self._set_file_preview_message(
+                    "Select a file",
+                    "Select a file to preview.",
+                )
+                return
+            root_name = self._files_workspace.name or str(self._files_workspace)
+            root_node = _FileTreeNode("", root_name, True)
+            root_item = self._make_file_item(root_node)
+            root_item.setToolTip(
+                0,
+                self._file_display_text(str(self._files_workspace), 500),
+            )
+            self.file_tree.addTopLevelItem(root_item)
+            self._populate_file_item(root_item)
+            root_item.setExpanded(True)
+            target = selection or self._selected_file_path
+            expanded = set(self._file_expanded_paths)
+            if target:
+                parts = PurePosixPath(target).parts[:-1]
+                expanded.update("/".join(parts[: index + 1]) for index in range(len(parts)))
+            for path in sorted(expanded, key=lambda value: (value.count("/"), value)):
+                item = self._file_items.get(path)
+                if item is None:
+                    continue
+                self._populate_file_item(item)
+                item.setExpanded(True)
+            if target:
+                self._materialize_file_path(target)
+                selected_item = self._file_items.get(target)
+                if selected_item is not None:
+                    self.file_tree.setCurrentItem(selected_item)
+        finally:
+            self.file_tree.blockSignals(old_blocked)
+        self.file_tree.verticalScrollBar().setValue(
+            min(scroll_value, self.file_tree.verticalScrollBar().maximum())
+        )
+        if self.file_tree.currentItem() is not None:
+            self._on_file_tree_select()
+        else:
+            self._selected_file_path = None
+            self._file_preview_generation += 1
+            self._set_file_preview_message("Select a file", "Select a file to preview.")
+
+    def _render_file_message(self, message: str) -> None:
+        old_blocked = self.file_tree.blockSignals(True)
+        try:
+            self.file_tree.clear()
+            self._file_items.clear()
+            self._add_file_message_item(message)
+        finally:
+            self.file_tree.blockSignals(old_blocked)
+
+    def _add_file_message_item(self, message: str) -> None:
+        item = QTreeWidgetItem([self._one_line(message, 160), ""])
+        item.setData(0, self.FILE_KIND_ROLE, "message")
+        item.setForeground(0, QBrush(QColor(self.COLORS["muted"])))
+        self.file_tree.addTopLevelItem(item)
+
+    def _make_file_item(self, node: _FileTreeNode) -> QTreeWidgetItem:
+        label = self._file_display_text(node.name, 160)
+        status = self._display_file_status(node.git_status)
+        item = QTreeWidgetItem([label, status])
+        kind = "directory" if node.is_directory else ("link" if node.is_link else "file")
+        item.setData(0, self.FILE_PATH_ROLE, node.relative_path)
+        item.setData(0, self.FILE_KIND_ROLE, kind)
+        item.setData(0, self.FILE_LOADED_ROLE, False)
+        item.setToolTip(
+            0,
+            self._file_display_text(node.relative_path or label, 500),
+        )
+        if node.is_directory:
+            icon = QStyle.StandardPixmap.SP_DirIcon
+        elif node.is_link:
+            icon = getattr(
+                QStyle.StandardPixmap,
+                "SP_FileLinkIcon",
+                QStyle.StandardPixmap.SP_FileIcon,
+            )
+        else:
+            icon = QStyle.StandardPixmap.SP_FileIcon
+        item.setIcon(0, self.style().standardIcon(icon))
+        self._apply_file_status_style(item, status)
+        self._file_items[node.relative_path] = item
+        if node.is_directory and self._file_nodes.get(node.relative_path):
+            placeholder = QTreeWidgetItem(["", ""])
+            placeholder.setData(0, self.FILE_KIND_ROLE, "placeholder")
+            item.addChild(placeholder)
+        return item
+
+    def _apply_file_status_style(self, item: QTreeWidgetItem, status: str) -> None:
+        if not status:
+            return
+        if "U" in status or "D" in status:
+            color = self.COLORS["danger"]
+        elif "A" in status:
+            color = self.COLORS["success"]
+        elif "?" in status:
+            color = self.COLORS["running"]
+        else:
+            color = self.COLORS["warning"]
+        item.setForeground(1, QBrush(QColor(color)))
+        font = item.font(1)
+        font.setWeight(QFont.Weight.DemiBold)
+        item.setFont(1, font)
+
+    def _populate_file_item(self, item: QTreeWidgetItem) -> None:
+        if item.data(0, self.FILE_KIND_ROLE) != "directory":
+            return
+        if bool(item.data(0, self.FILE_LOADED_ROLE)):
+            return
+        relative_path = str(item.data(0, self.FILE_PATH_ROLE) or "")
+        item.takeChildren()
+        for node in self._file_nodes.get(relative_path, ()):
+            item.addChild(self._make_file_item(node))
+        item.setData(0, self.FILE_LOADED_ROLE, True)
+
+    def _materialize_file_path(self, relative_path: str) -> None:
+        parts = PurePosixPath(relative_path).parts
+        parent = ""
+        for index in range(len(parts)):
+            parent_item = self._file_items.get(parent)
+            if parent_item is None:
+                return
+            self._populate_file_item(parent_item)
+            if index < len(parts) - 1:
+                parent_item.setExpanded(True)
+            parent = "/".join(parts[: index + 1])
+
+    def _on_file_item_expanded(self, item: QTreeWidgetItem) -> None:
+        if item.data(0, self.FILE_KIND_ROLE) != "directory":
+            return
+        path = str(item.data(0, self.FILE_PATH_ROLE) or "")
+        self._file_expanded_paths.add(path)
+        self._populate_file_item(item)
+
+    def _on_file_item_collapsed(self, item: QTreeWidgetItem) -> None:
+        if item.data(0, self.FILE_KIND_ROLE) != "directory":
+            return
+        path = str(item.data(0, self.FILE_PATH_ROLE) or "")
+        if path:
+            self._file_expanded_paths.discard(path)
+
+    def _schedule_file_filter(self, _text: str) -> None:
+        self._file_filter_timer.start()
+
+    def _apply_file_filter(self, *, selection: str | None = None) -> None:
+        if self._file_index is None:
+            return
+        query = self.file_search_entry.text().strip().casefold()
+        if not query:
+            self.file_count_label.setText(
+                f"{len(self._file_index.files)}{'+' if self._file_index.truncated else ''} files"
+            )
+            self._render_file_tree(selection=selection)
+            return
+        matches = [
+            entry
+            for entry in self._file_index.files
+            if query in entry.relative_path.casefold()
+        ]
+        limited = matches[: self.MAX_FILE_SEARCH_RESULTS]
+        old_blocked = self.file_tree.blockSignals(True)
+        try:
+            self.file_tree.clear()
+            self.file_tree.setRootIsDecorated(False)
+            self._file_items.clear()
+            for entry in limited:
+                node = _FileTreeNode(
+                    entry.relative_path,
+                    entry.relative_path,
+                    False,
+                    entry.git_status,
+                    entry.is_link,
+                )
+                self.file_tree.addTopLevelItem(self._make_file_item(node))
+            if not limited:
+                self._add_file_message_item("No matching files")
+            target = selection or self._selected_file_path
+            if target and target in self._file_items:
+                self.file_tree.setCurrentItem(self._file_items[target])
+        finally:
+            self.file_tree.blockSignals(old_blocked)
+        suffix = "+" if len(matches) > len(limited) else ""
+        self.file_count_label.setText(f"{len(limited)}{suffix} matches")
+        if self.file_tree.currentItem() is not None:
+            self._on_file_tree_select()
+        else:
+            self._selected_file_path = None
+            self._file_preview_generation += 1
+            self._set_file_preview_message("Select a file", "Select a file to preview.")
+
+    def _on_file_tree_select(self) -> None:
+        selected = self.file_tree.selectedItems()
+        if not selected:
+            return
+        self._file_selection_revision += 1
+        item = selected[0]
+        kind = str(item.data(0, self.FILE_KIND_ROLE) or "")
+        relative_path = str(item.data(0, self.FILE_PATH_ROLE) or "")
+        if kind == "directory":
+            self._selected_file_path = None
+            self._file_preview_generation += 1
+            label = relative_path or (self._files_workspace.name or str(self._files_workspace))
+            self._set_file_preview_message(label, "Select a file to preview.", "Folder")
+            return
+        if kind not in {"file", "link"} or not relative_path:
+            return
+        self._selected_file_path = relative_path
+        if kind == "link":
+            self._set_file_preview_message(
+                relative_path,
+                "Links are not previewed.",
+                "Link",
+            )
+            return
+        self._start_file_preview(relative_path)
+
+    def _start_file_preview(self, relative_path: str) -> None:
+        if self._closed or self._file_workers_stopped:
+            return
+        self._file_preview_generation += 1
+        generation = self._file_preview_generation
+        workspace = self._files_workspace
+        self._set_file_preview_message(relative_path, "Loading preview.", "Loading")
+        self._offer_latest(
+            self._file_preview_requests,
+            (generation, workspace, relative_path),
+        )
+
+    def _file_preview_worker_loop(self) -> None:
+        while True:
+            request = self._file_preview_requests.get()
+            if request is None:
+                return
+            generation, workspace, relative_path = request
+            try:
+                preview = preview_workspace_file(workspace, relative_path)
+            except Exception:
+                preview = WorkspaceFilePreview(relative_path, "unreadable")
+            if self._closed:
+                continue
+            self._offer_latest(
+                self._file_preview_queue,
+                (generation, workspace, preview),
+            )
+
+    def _apply_file_preview(self, preview: WorkspaceFilePreview) -> None:
+        if preview.status == "text":
+            self.file_preview_path.setText(
+                self._file_display_text(preview.relative_path, 220)
+            )
+            self.file_preview_path.setToolTip(
+                self._file_display_text(preview.relative_path, 500)
+            )
+            meta = f"{self._format_file_size(preview.size_bytes)} | {preview.line_count} lines"
+            if preview.truncated:
+                meta += " | limited"
+            self.file_preview_meta.setText(meta)
+            rendered = self._number_file_preview(preview.text, preview.line_count)
+            if preview.truncated:
+                rendered = f"{rendered}\n\n[preview truncated]".strip()
+            self._replace_text(self.file_preview_text, rendered or "[empty file]")
+            return
+        messages = {
+            "binary": "Binary or non-UTF-8 file. Preview is unavailable.",
+            "too_large": "File is too large for automatic preview.",
+            "sensitive": "Preview is hidden for this sensitive path.",
+            "outside": "Preview path is outside the workspace.",
+            "missing": "File no longer exists.",
+            "directory": "Select a file to preview.",
+            "link": "Links are not previewed.",
+            "unreadable": "File could not be read.",
+        }
+        meta = self._format_file_size(preview.size_bytes) if preview.size_bytes else ""
+        self._set_file_preview_message(
+            preview.relative_path,
+            messages.get(preview.status, "Preview is unavailable."),
+            meta,
+        )
+
+    def _set_file_preview_message(
+        self,
+        path: str,
+        message: str,
+        meta: str = "",
+    ) -> None:
+        safe_path = self._file_display_text(path, 220)
+        self.file_preview_path.setText(safe_path)
+        self.file_preview_path.setToolTip(self._file_display_text(path, 500))
+        self.file_preview_meta.setText(meta)
+        self._replace_text(self.file_preview_text, message)
+
+    @classmethod
+    def _file_display_text(cls, value: str, limit: int) -> str:
+        safe_value = redact_secrets(value)
+        safe_value = cls.CONTROL_CHAR_RE.sub("", safe_value)
+        safe_value = cls.BIDI_CONTROL_RE.sub("", safe_value)
+        return cls._one_line(safe_value, limit)
+
+    @staticmethod
+    def _format_file_size(size: int) -> str:
+        if size < 1_024:
+            return f"{size} B"
+        if size < 1_024 * 1_024:
+            return f"{size / 1_024:.1f} KB"
+        return f"{size / (1_024 * 1_024):.1f} MB"
+
+    @staticmethod
+    def _number_file_preview(text: str, total_lines: int) -> str:
+        if not text:
+            return ""
+        lines = text.split("\n")
+        width = len(str(max(total_lines, len(lines), 1)))
+        return "\n".join(
+            f"{number:>{width}} | {line}"
+            for number, line in enumerate(lines, start=1)
+        )
 
     def _insert_timeline(
         self, state: str, action: str, summary: str, details: str, tag: str
@@ -1391,6 +2167,7 @@ class TinyForgeApp(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API
         if self._closed:
+            self._stop_file_workers()
             event.accept()
             return
         if self.worker.is_running:
@@ -1407,6 +2184,7 @@ class TinyForgeApp(QMainWindow):
             if not self.worker.cancel():
                 self._closed = True
                 self._drain_timer.stop()
+                self._stop_file_workers()
                 event.accept()
                 return
             self._closing = True
@@ -1417,6 +2195,7 @@ class TinyForgeApp(QMainWindow):
             return
         self._closed = True
         self._drain_timer.stop()
+        self._stop_file_workers()
         event.accept()
 
     def _close_after_terminal_event(self) -> None:
@@ -1427,7 +2206,12 @@ class TinyForgeApp(QMainWindow):
         if self._closed:
             return
         self._drain_timer.stop()
+        self._file_refresh_timer.stop()
+        self._file_filter_timer.stop()
+        self._file_generation += 1
+        self._file_preview_generation += 1
         self._closed = True
+        self._stop_file_workers()
         self.close()
         self.deleteLater()
 

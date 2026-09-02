@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -28,12 +29,16 @@ if QApplication is not None:
     from tinyforge.config import Config
     from tinyforge.gui import TinyForgeApp
     from tinyforge.gui_support import AgentWorker
+    from tinyforge.workspace_view import WorkspaceFile, WorkspaceFilePreview, WorkspaceIndex
 else:
     AgentEvent = None
     AgentResult = None
     Config = None
     AgentWorker = None
     TinyForgeApp = None
+    WorkspaceFile = None
+    WorkspaceFilePreview = None
+    WorkspaceIndex = None
 
 
 class ImmediateAgent:
@@ -212,6 +217,16 @@ class GuiWidgetTests(unittest.TestCase):
         self.app._drain_queue()
         self.qt_app.processEvents()
 
+    def _wait_until(self, predicate, timeout: float = 3.0) -> None:
+        deadline = time.monotonic() + timeout
+        while not predicate() and time.monotonic() < deadline:
+            self.app._drain_file_queues()
+            self.qt_app.processEvents()
+            time.sleep(0.005)
+        self.app._drain_file_queues()
+        self.qt_app.processEvents()
+        self.assertTrue(predicate())
+
     def test_all_result_states_clear_queued_and_running_rows(self) -> None:
         assert AgentResult is not None
         cases = (
@@ -265,12 +280,13 @@ class GuiWidgetTests(unittest.TestCase):
         self.assertTrue(selected_text.isValid())
         self.assertNotEqual(selected_background.rgba(), selected_text.rgba())
 
-    def test_terminal_is_a_read_only_fourth_inspector_tab(self) -> None:
+    def test_terminal_is_a_read_only_inspector_tab(self) -> None:
         assert Qt is not None
         assert QPlainTextEdit is not None
-        self.assertEqual(self.app.inspector.count(), 4)
-        self.assertEqual(self.app.inspector.tabText(3), "Terminal")
-        self.assertIs(self.app.inspector.widget(3), self.app.terminal_text)
+        self.assertEqual(self.app.inspector.count(), 5)
+        terminal_index = self.app.inspector.indexOf(self.app.terminal_text)
+        self.assertEqual(self.app.inspector.tabText(terminal_index), "Terminal")
+        self.assertIs(self.app.inspector.widget(terminal_index), self.app.terminal_text)
         self.assertTrue(self.app.terminal_text.isReadOnly())
         self.assertFalse(self.app.terminal_text.isUndoRedoEnabled())
         self.assertEqual(
@@ -281,6 +297,328 @@ class GuiWidgetTests(unittest.TestCase):
             self.app.terminal_text.horizontalScrollBarPolicy(),
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
         )
+
+    def test_files_is_a_read_only_fifth_inspector_tab(self) -> None:
+        assert QPlainTextEdit is not None
+        files_index = self.app.inspector.indexOf(self.app.files_tab)
+        self.assertEqual(files_index, 4)
+        self.assertTrue(self.app.inspector.tabText(files_index).startswith("Files"))
+        self.assertIs(self.app.inspector.widget(files_index), self.app.files_tab)
+        self.assertTrue(self.app.file_preview_text.isReadOnly())
+        self.assertFalse(self.app.file_preview_text.isUndoRedoEnabled())
+        self.assertEqual(
+            self.app.file_preview_text.lineWrapMode(),
+            QPlainTextEdit.LineWrapMode.NoWrap,
+        )
+        self.assertEqual(self.app.file_tree.columnCount(), 2)
+        self.assertEqual(self.app.file_tree.headerItem().text(1), "GIT")
+
+    def test_files_tree_filters_previews_and_preserves_selection_on_refresh(self) -> None:
+        workspace = Path(self.temp.name)
+        secret = "sk-" + "abcdefghijklmnopqrstuvwxyz123456"
+        (workspace / "src").mkdir()
+        (workspace / "src" / "app.py").write_text(
+            f"token = '{secret}'\nprint('ready')\n",
+            encoding="utf-8",
+        )
+        (workspace / "src" / "helper.py").write_text(
+            "def helper():\n    return 1\n",
+            encoding="utf-8",
+        )
+        (workspace / "binary.dat").write_bytes(b"binary\0payload")
+        secret_filename = f"result-{secret}.py"
+        (workspace / secret_filename).write_text("value = 1\n", encoding="utf-8")
+        (workspace / ".env").write_text("PASSWORD=hidden\n", encoding="utf-8")
+        (workspace / ".demo").mkdir()
+        (workspace / ".demo" / "recording.mp4").write_bytes(b"video")
+
+        self.app._request_files_refresh(delay_ms=0)
+        self._wait_until(
+            lambda: self.app.file_refresh_button.isEnabled()
+            and "src/app.py" in self.app._file_entries
+        )
+
+        self.assertNotIn(".env", self.app._file_entries)
+        self.assertNotIn(".demo/recording.mp4", self.app._file_entries)
+        self.assertIn(secret_filename, self.app._file_entries)
+        secret_item = self.app._file_items[secret_filename]
+        self.assertNotIn(secret, secret_item.text(0))
+        self.assertNotIn(secret, secret_item.toolTip(0))
+        self.assertIn("REDACTED", secret_item.text(0))
+        self.assertIn("src", self.app._file_items)
+        self.assertNotIn("src/app.py", self.app._file_items)
+
+        src_item = self.app._file_items["src"]
+        self.app.file_tree.expandItem(src_item)
+        self.qt_app.processEvents()
+        self.assertIn("src/app.py", self.app._file_items)
+        app_item = self.app._file_items["src/app.py"]
+        self.app.file_tree.setCurrentItem(app_item)
+        self.qt_app.processEvents()
+        self._wait_until(lambda: self.app.file_preview_meta.text() != "Loading")
+
+        rendered = self.app.file_preview_text.toPlainText()
+        self.assertIn("1 |", rendered)
+        self.assertIn("print('ready')", rendered)
+        self.assertNotIn(secret, rendered)
+        self.assertIn("REDACTED", rendered)
+
+        (workspace / "src" / "new.py").write_text("created = True\n", encoding="utf-8")
+        self.app._request_files_refresh(delay_ms=0)
+        self._wait_until(
+            lambda: self.app.file_refresh_button.isEnabled()
+            and "src/new.py" in self.app._file_entries
+        )
+        self.assertTrue(self.app._file_items["src"].isExpanded())
+        current = self.app.file_tree.currentItem()
+        self.assertIsNotNone(current)
+        self.assertEqual(
+            current.data(0, self.app.FILE_PATH_ROLE),
+            "src/app.py",
+        )
+
+        self.app.file_search_entry.setText("helper")
+        self.app._apply_file_filter()
+        self.assertEqual(self.app.file_tree.topLevelItemCount(), 1)
+        self.assertEqual(
+            self.app.file_tree.topLevelItem(0).data(0, self.app.FILE_PATH_ROLE),
+            "src/helper.py",
+        )
+        self.assertIn("matches", self.app.file_count_label.text())
+
+        self.app.file_search_entry.clear()
+        self.app._apply_file_filter()
+        self.assertTrue(self.app.file_tree.rootIsDecorated())
+        binary_item = self.app._file_items["binary.dat"]
+        self.app.file_tree.setCurrentItem(binary_item)
+        self.qt_app.processEvents()
+        self._wait_until(
+            lambda: "unavailable" in self.app.file_preview_text.toPlainText()
+        )
+
+        secret_item = self.app._file_items[secret_filename]
+        self.app.file_tree.setCurrentItem(secret_item)
+        self.qt_app.processEvents()
+        self._wait_until(lambda: self.app.file_preview_meta.text() != "Loading")
+        self.assertNotIn(secret, self.app.file_preview_path.text())
+        self.assertNotIn(secret, self.app.file_preview_path.toolTip())
+        self.assertNotIn("\u202e", self.app._file_display_text("left\u202eright", 80))
+
+    def test_file_preview_worker_keeps_only_the_latest_pending_request(self) -> None:
+        assert WorkspaceFilePreview is not None
+        started = threading.Event()
+        release = threading.Event()
+        calls: list[str] = []
+
+        def slow_preview(_workspace: Path, relative_path: str) -> WorkspaceFilePreview:
+            calls.append(relative_path)
+            started.set()
+            release.wait(timeout=2)
+            return WorkspaceFilePreview(relative_path, "text", text="ok", line_count=1)
+
+        with patch("tinyforge.gui.preview_workspace_file", side_effect=slow_preview):
+            try:
+                self.app._selected_file_path = "file-0.py"
+                self.app._start_file_preview("file-0.py")
+                self.assertTrue(started.wait(timeout=1))
+                for index in range(1, 50):
+                    relative_path = f"file-{index}.py"
+                    self.app._selected_file_path = relative_path
+                    self.app._start_file_preview(relative_path)
+                self.assertLessEqual(self.app._file_preview_requests.qsize(), 1)
+                self.assertLessEqual(self.app._file_preview_queue.qsize(), 1)
+            finally:
+                release.set()
+            self._wait_until(lambda: len(calls) >= 2)
+
+        self.assertEqual(calls, ["file-0.py", "file-49.py"])
+
+    def test_file_refresh_does_not_restore_selection_over_a_newer_choice(self) -> None:
+        assert WorkspaceFile is not None
+        assert WorkspaceIndex is not None
+        workspace = self.app._files_workspace
+        index = WorkspaceIndex(
+            workspace,
+            (WorkspaceFile("a.py"), WorkspaceFile("b.py")),
+        )
+        self.app._apply_file_index(index, None)
+        self.app.file_tree.setCurrentItem(self.app._file_items["a.py"])
+        self.qt_app.processEvents()
+        captured_revision = self.app._file_selection_revision
+        self.app.file_tree.setCurrentItem(self.app._file_items["b.py"])
+        self.qt_app.processEvents()
+
+        self.app._offer_latest(
+            self.app._file_index_queue,
+            (
+                self.app._file_generation,
+                workspace,
+                index,
+                "a.py",
+                captured_revision,
+            ),
+        )
+        self.app._drain_file_queues()
+
+        current = self.app.file_tree.currentItem()
+        self.assertIsNotNone(current)
+        self.assertEqual(current.data(0, self.app.FILE_PATH_ROLE), "b.py")
+
+    def test_debounced_file_target_does_not_override_a_newer_choice(self) -> None:
+        assert WorkspaceFile is not None
+        assert WorkspaceIndex is not None
+        workspace = self.app._files_workspace
+        index = WorkspaceIndex(
+            workspace,
+            (WorkspaceFile("created.py"), WorkspaceFile("chosen.py")),
+        )
+        self.app._apply_file_index(index, None)
+        requested_revision = self.app._file_selection_revision
+        self.app._request_files_refresh("created.py")
+        self.app.file_tree.setCurrentItem(self.app._file_items["chosen.py"])
+        self.qt_app.processEvents()
+
+        with patch.object(self.app, "_start_file_refresh") as start_refresh:
+            self.app._refresh_files()
+
+        start_refresh.assert_called_once_with(
+            workspace,
+            "created.py",
+            selection_revision=requested_revision,
+        )
+
+    def test_files_tree_renders_git_status_for_files_and_directories(self) -> None:
+        assert WorkspaceFile is not None
+        assert WorkspaceIndex is not None
+        self._wait_until(
+            lambda: self.app.file_refresh_button.isEnabled()
+            and self.app._file_index is not None
+        )
+        workspace = Path(self.temp.name).resolve()
+        index = WorkspaceIndex(
+            workspace,
+            (
+                WorkspaceFile("src/app.py", " M"),
+                WorkspaceFile("new.py", "??"),
+            ),
+            git_available=True,
+        )
+
+        self.app._apply_file_index(index, None)
+
+        self.assertEqual(self.app._file_items["src"].text(1), "M")
+        self.assertEqual(self.app._file_items["new.py"].text(1), "?")
+        self.app.file_tree.expandItem(self.app._file_items["src"])
+        self.qt_app.processEvents()
+        self.assertEqual(self.app._file_items["src/app.py"].text(1), "M")
+        self.assertEqual(
+            self.app.inspector.tabText(self.app.inspector.indexOf(self.app.files_tab)),
+            "Files (2)",
+        )
+
+    def test_successful_file_tools_schedule_refresh_and_failed_tools_do_not(self) -> None:
+        assert AgentEvent is not None
+        with patch.object(self.app, "_request_files_refresh") as refresh:
+            self.app._render_agent_event(
+                AgentEvent(
+                    "tool_start",
+                    {
+                        "call_id": "write-ok",
+                        "name": "write_file",
+                        "arguments": {"path": "created.py", "content": "value = 1\n"},
+                    },
+                )
+            )
+            self.app._render_agent_event(
+                AgentEvent(
+                    "tool_end",
+                    {
+                        "call_id": "write-ok",
+                        "name": "write_file",
+                        "output": "{}",
+                        "output_ok": True,
+                        "output_summary": "created.py",
+                    },
+                )
+            )
+            refresh.assert_called_once_with("created.py")
+
+            refresh.reset_mock()
+            self.app._render_agent_event(
+                AgentEvent(
+                    "tool_start",
+                    {
+                        "call_id": "write-failed",
+                        "name": "write_file",
+                        "arguments": {"path": "failed.py", "content": ""},
+                    },
+                )
+            )
+            self.app._render_agent_event(
+                AgentEvent(
+                    "tool_end",
+                    {
+                        "call_id": "write-failed",
+                        "name": "write_file",
+                        "output": "{}",
+                        "output_ok": False,
+                        "output_summary": "failed",
+                    },
+                )
+            )
+            refresh.assert_not_called()
+
+            self.app._render_agent_event(
+                AgentEvent(
+                    "tool_end",
+                    {
+                        "call_id": "command-failed",
+                        "name": "run_command",
+                        "output": "{}",
+                        "output_ok": False,
+                        "output_summary": "exit 1",
+                    },
+                )
+            )
+            refresh.assert_called_once_with(delay_ms=250)
+
+    def test_files_discard_stale_background_results(self) -> None:
+        assert WorkspaceFile is not None
+        assert WorkspaceIndex is not None
+        workspace = self.app._files_workspace
+        current_generation = self.app._file_generation
+        self.app._file_index_queue.put(
+            (
+                current_generation - 1,
+                workspace,
+                WorkspaceIndex(workspace, (WorkspaceFile("stale.py"),)),
+                None,
+                self.app._file_selection_revision,
+            )
+        )
+        self.app._drain_file_queues()
+        self.assertNotIn("stale.py", self.app._file_entries)
+
+    def test_empty_or_failed_file_refresh_clears_old_preview(self) -> None:
+        assert WorkspaceFile is not None
+        assert WorkspaceIndex is not None
+        workspace = self.app._files_workspace
+        self.app._selected_file_path = "old.py"
+        self.app.file_preview_text.setPlainText("1 | VISIBLE_OLD_CONTENT")
+
+        self.app._apply_file_index(WorkspaceIndex(workspace, ()), None)
+
+        self.assertIsNone(self.app._selected_file_path)
+        self.assertNotIn("VISIBLE_OLD_CONTENT", self.app.file_preview_text.toPlainText())
+
+        self.app._selected_file_path = "old.py"
+        self.app.file_preview_text.setPlainText("1 | VISIBLE_OLD_CONTENT")
+        self.app._apply_file_index(
+            WorkspaceIndex(workspace, (), error="Workspace is not available."),
+            None,
+        )
+        self.assertIsNone(self.app._selected_file_path)
+        self.assertNotIn("VISIBLE_OLD_CONTENT", self.app.file_preview_text.toPlainText())
 
     def test_terminal_renders_streams_exit_status_without_duplicate_output(self) -> None:
         assert AgentEvent is not None
@@ -711,6 +1049,8 @@ class GuiWidgetTests(unittest.TestCase):
         workspace.mkdir()
         self.app._append_terminal("old workspace output\n")
         self.app._terminal_commands["pending"] = object()
+        self.app._selected_file_path = "old.py"
+        self.app.file_preview_text.setPlainText("old workspace preview")
         self.app._mark_settings_dirty()
         self.app.workspace_entry.setText(str(workspace))
 
@@ -719,6 +1059,9 @@ class GuiWidgetTests(unittest.TestCase):
         self.assertEqual(self.app.terminal_text.toPlainText(), "")
         self.assertEqual(self.app._terminal_commands, {})
         self.assertEqual(self.app._terminal_workspace, workspace.resolve())
+        self.assertEqual(self.app._files_workspace, workspace.resolve())
+        self.assertIsNone(self.app._selected_file_path)
+        self.assertNotIn("old workspace preview", self.app.file_preview_text.toPlainText())
         self.assertFalse(self.app._has_session)
 
     def test_browsing_workspace_loads_its_runtime_defaults(self) -> None:
@@ -744,6 +1087,7 @@ class GuiWidgetTests(unittest.TestCase):
         self.assertEqual(self.app.protocol_combo.currentText(), "responses")
         self.assertFalse(self.app.memory_check.isChecked())
         self.assertEqual(self.app._settings_workspace, workspace.resolve())
+        self.assertEqual(self.app._files_workspace, workspace.resolve())
         self.assertFalse(self.app._settings_dirty)
 
     def test_manual_workspace_switch_preserves_explicit_runtime_settings(self) -> None:

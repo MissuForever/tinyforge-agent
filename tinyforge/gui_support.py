@@ -16,6 +16,7 @@ from .agent import Agent, AgentEvent, AgentResult
 from .config import Config
 from .memory import redact_secrets
 from .runtime import build_agent
+from .workspace_view import is_sensitive_workspace_path as _is_sensitive_path
 
 
 MAX_UI_TEXT = 20_000
@@ -28,28 +29,6 @@ MAX_UI_STREAM_LINE = MAX_UI_TEXT
 _TRUNCATED = "[TRUNCATED]"
 _OMITTED_STREAM_LINE = "[output line omitted: exceeds display limit]\n"
 _OMITTED_BUSY_OUTPUT = "[output omitted: GUI queue was busy]\n"
-_SENSITIVE_NAMES = {
-    ".env",
-    ".netrc",
-    ".npmrc",
-    ".pypirc",
-    "credentials",
-    "id_dsa",
-    "id_ed25519",
-    "id_rsa",
-}
-_SENSITIVE_SUFFIXES = {
-    ".gpg",
-    ".jks",
-    ".key",
-    ".keystore",
-    ".p12",
-    ".pem",
-    ".pfx",
-    ".pgp",
-}
-_SENSITIVE_DIRECTORIES = {".aws", ".azure", ".gnupg", ".ssh"}
-_PRIVATE_KEY_PREFIXES = ("id_dsa.", "id_ed25519.", "id_rsa.")
 _REDACTION_MARKERS = ("[REDACTED_API_KEY]", "[REDACTED]")
 
 
@@ -257,21 +236,6 @@ def command_terminal_result(output: str) -> dict[str, Any]:
     if type(exit_code) is int:
         terminal_result["exit_code"] = exit_code
     return terminal_result
-
-
-def _is_sensitive_path(path: Path) -> bool:
-    lowered_parts = {part.casefold() for part in path.parts}
-    name = path.name.casefold()
-    return (
-        bool(lowered_parts & (_SENSITIVE_NAMES | _SENSITIVE_DIRECTORIES))
-        or name.startswith(".env.")
-        or name.startswith(_PRIVATE_KEY_PREFIXES)
-        or "credential" in name
-        or "private_key" in name
-        or "private-key" in name
-        or "secret" in name
-        or path.suffix.casefold() in _SENSITIVE_SUFFIXES
-    )
 
 
 def snapshot_text_file(workspace: Path, relative_path: str) -> FileSnapshot | None:

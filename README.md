@@ -16,7 +16,7 @@ Chat Completions 或 Responses API，解析模型原生 tool calling，在本机
 - `edit_file`：精确局部替换，避免意外修改多处内容
 - `run_command`：在工作区执行 PowerShell 或 POSIX shell 命令
 - 单任务与连续对话两种 CLI 使用方式
-- PySide6 桌面操作台：实时执行时间线、工具详情、代码 Diff、记忆概览和命令输出
+- PySide6 桌面操作台：执行时间线、代码 Diff、记忆、命令输出和工作区文件总览
 - 工具异常结构化回传，模型可读取错误并自行修正
 - 命令超时、工作区路径隔离、危险命令拦截
 - 工具输出截断、对话上下文裁剪、最大轮数和重复调用保护
@@ -89,7 +89,9 @@ py -3 -m tinyforge.gui
 默认跟随操作系统的高 DPI 与逐显示器缩放；Agent 在单独的后台线程运行，工具事件通过
 队列送回 GUI 线程，因此模型请求和命令执行不会冻结窗口。界面不会显示或保存 API Key，
 配置仍来自环境变量或未入库的 `.env`。`Terminal` 标签会按行显示 Agent 执行的命令、
-标准输出、错误输出和退出码；它是只读审计视图，不提供任意命令输入入口。
+标准输出、错误输出和退出码；它是只读审计视图，不提供任意命令输入入口。`Files` 标签
+在后台索引 Git 可见文件，支持文件名过滤、Git 状态和带行号的只读预览；非 Git 工作区
+会使用有界扫描，敏感路径、缓存目录、目录链接、二进制文件和过大文件不会自动读取。
 
 需要保留主屏工作时，可让窗口直接在副屏居中打开，无需手动拖动：
 
@@ -135,6 +137,7 @@ tinyforge-gui --help
 - `tinyforge/cli.py`：终端展示和交互会话
 - `tinyforge/runtime.py`：CLI 与 GUI 共用的运行时装配
 - `tinyforge/gui_support.py`：后台任务、事件隔离、脱敏和文件 Diff
+- `tinyforge/workspace_view.py`：GUI 文件索引、Git 状态和安全预览
 - `tinyforge/gui.py`：基于 PySide6 / Qt Widgets 的桌面界面
 
 更完整的设计说明和面试问答见 [`docs/design.md`](docs/design.md)，录制流程见
@@ -180,6 +183,8 @@ py -3 -m unittest discover -s tests -v
 危险命令拦截、超长结果、上下文裁剪以及完整的模型-工具两轮闭环。CLI 集成测试还会启动
 本地 OpenAI 兼容 HTTP 端点和真实子进程，验证请求、工具执行、结果回传及最终退出状态。
 记忆测试覆盖跨实例复用、工作区隔离、L1 上限、证据门禁、后置验证及档案脱敏。
+GUI 测试还覆盖文件树懒展开、过滤、Git 状态、敏感路径隐藏、二进制拒绝、后台结果隔离和
+Agent 修改后的自动刷新。
 
 安装 GUI 可选依赖后，可在没有显示器的 CI 或远程环境中执行离屏窗口 smoke test：
 
