@@ -77,12 +77,22 @@ def make_intro(path: Path, result: dict[str, Any]) -> None:
         font=font(SANS, 29),
         fill=CYAN,
     )
-    labels = [
-        ("01", "建立基线", "4 项测试，3 项失败"),
-        ("02", "自主修复", "只修改 pricing.py"),
-        ("03", "执行验证", "完整测试 exit=0"),
-        ("04", "提交记忆", "保存带证据 SOP"),
-    ]
+    skills_enabled = result.get("configuration", {}).get("skills_enabled") is True
+    labels = (
+        [
+            ("01", "检索 Skill", "按任务加载只读指南"),
+            ("02", "建立基线", "4 项测试，3 项失败"),
+            ("03", "自主修复", "只修改 pricing.py"),
+            ("04", "验证与记忆", "测试全过并保存 SOP"),
+        ]
+        if skills_enabled
+        else [
+            ("01", "建立基线", "4 项测试，3 项失败"),
+            ("02", "自主修复", "只修改 pricing.py"),
+            ("03", "执行验证", "完整测试 exit=0"),
+            ("04", "提交记忆", "保存带证据 SOP"),
+        ]
+    )
     for index, (number, title, detail) in enumerate(labels):
         left = 72 + index * 440
         box(draw, (left, 390, left + 390, 680), PANEL)
@@ -92,7 +102,8 @@ def make_intro(path: Path, result: dict[str, Any]) -> None:
     config = result["configuration"]
     draw.text(
         (72, 800),
-        f"Model  {config['model']}    Protocol  {config['wire_api']}    Memory  on",
+        f"Model  {config['model']}    Protocol  {config['wire_api']}    "
+        f"Skills  {'on' if skills_enabled else 'off'}    Memory  on",
         font=font(MONO, 25),
         fill=YELLOW,
     )
@@ -136,7 +147,7 @@ def make_outro(path: Path, result: dict[str, Any]) -> None:
     )
     draw.text(
         (72, 958),
-        "执行记录、统一 Diff 和持久记忆证据均保留在本次演示产物中。",
+        "Skill receipt、执行记录、统一 Diff 和持久记忆证据均保留在本次演示产物中。",
         font=font(SANS, 23),
         fill=MUTED,
     )
@@ -548,9 +559,10 @@ def make_live_footer(
         font=font(MONO, 27),
         fill=GREEN,
     )
+    feature_text = "Responses API  |  Files  |  Skills  |  Memory"
     draw.text(
         (72, gui_height + 102),
-        f"{result['configuration']['model']}  |  Responses API  |  Files  |  Memory",
+        f"{result['configuration']['model']}  |  {feature_text}",
         font=font(SANS, 25),
         fill=TEXT,
     )
@@ -725,6 +737,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         and result.get("files_showcase", {}).get("preview_ready")
         and "M" in str(result.get("files_showcase", {}).get("git_status", ""))
         and result.get("files_marker_recorded")
+        and (
+            result.get("configuration", {}).get("skills_enabled") is not True
+            or (
+                result.get("skill_showcase", {}).get("enabled") is True
+                and result.get("skill_showcase", {}).get("search_count", 0) >= 1
+                and "workspace:verified-bugfix"
+                in result.get("skill_showcase", {}).get("loaded", [])
+                and result.get("skill_showcase", {}).get("receipts_complete") is True
+                and result.get("skill_marker_recorded") is True
+            )
+        )
         and has_ordered_gui_test_evidence(result)
         and raw_video.is_file()
     )
@@ -772,7 +795,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         (
             live_time(marker_time(result, "task_typing_started", 2.0)),
-            "桌面端已经加载独立工作区、真实模型和记忆模块。现在输入带约束和验证要求的任务。",
+            "桌面端已经加载独立工作区、真实模型、技能和记忆模块。任务先检索并加载匹配的只读技能，再进入修复流程。",
         ),
         (
             live_time(setup_end + 9.0),
@@ -790,6 +813,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         (
             live_time(marker_time(result, "workspace_files", terminal + 18.0)) + 0.5,
             "左侧工作区同步显示目录结构和 Git 状态。pricing 点 py 标记为已修改，文件树下方可直接查看带行号的安全只读预览。",
+        ),
+        (
+            live_time(marker_time(result, "skill_receipt", terminal + 36.0)) + 0.4,
+            "技能页保留任务检索、加载顺序和内容哈希。技能始终只读，不会扩大 Agent 的工具权限。",
         ),
         (
             INTRO_SECONDS + gui_duration + 0.5,

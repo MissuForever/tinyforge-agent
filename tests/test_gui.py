@@ -16,10 +16,16 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 try:
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QPalette
-    from PySide6.QtWidgets import QApplication, QMessageBox, QPlainTextEdit
+    from PySide6.QtWidgets import (
+        QAbstractItemView,
+        QApplication,
+        QMessageBox,
+        QPlainTextEdit,
+    )
 except ImportError:
     Qt = None
     QPalette = None
+    QAbstractItemView = None
     QApplication = None
     QMessageBox = None
     QPlainTextEdit = None
@@ -208,6 +214,18 @@ class GuiWidgetTests(unittest.TestCase):
             for index in range(self.app.timeline.topLevelItemCount())
         ]
 
+    def _skill_tree_text(self) -> str:
+        values: list[str] = []
+
+        def collect(item) -> None:
+            values.extend(item.text(column) for column in range(item.columnCount()))
+            for child_index in range(item.childCount()):
+                collect(item.child(child_index))
+
+        for item_index in range(self.app.skill_tree.topLevelItemCount()):
+            collect(self.app.skill_tree.topLevelItem(item_index))
+        return "\n".join(values)
+
     def _drain_worker(self, timeout: float = 2.0) -> None:
         deadline = time.monotonic() + timeout
         while self.app.worker.is_running and time.monotonic() < deadline:
@@ -283,7 +301,7 @@ class GuiWidgetTests(unittest.TestCase):
     def test_command_output_is_a_read_only_standalone_bottom_panel(self) -> None:
         assert Qt is not None
         assert QPlainTextEdit is not None
-        self.assertEqual(self.app.inspector.count(), 3)
+        self.assertEqual(self.app.inspector.count(), 4)
         self.assertFalse(self.app.inspector.tabBar().usesScrollButtons())
         self.assertEqual(self.app.inspector.indexOf(self.app.terminal_text), -1)
         self.assertEqual(self.app.center_splitter.orientation(), Qt.Orientation.Vertical)
@@ -294,6 +312,13 @@ class GuiWidgetTests(unittest.TestCase):
         self.assertGreater(self.app.center_splitter.sizes()[1], 0)
         self.assertEqual(self.app.terminal_count_label.text(), "0 commands")
         self.assertTrue(self.app.terminal_text.isReadOnly())
+        assert QAbstractItemView is not None
+        self.assertTrue(self.app.skills_tab.isAncestorOf(self.app.skill_tree))
+        self.assertEqual(
+            self.app.skill_tree.editTriggers(),
+            QAbstractItemView.EditTrigger.NoEditTriggers,
+        )
+        self.assertTrue(self.app.skills_check.isEnabled())
         self.assertFalse(self.app.terminal_text.isUndoRedoEnabled())
         self.assertEqual(
             self.app.terminal_text.lineWrapMode(),
@@ -302,6 +327,46 @@ class GuiWidgetTests(unittest.TestCase):
         self.assertNotEqual(
             self.app.terminal_text.horizontalScrollBarPolicy(),
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+        )
+
+    def test_secondary_screen_minimum_keeps_settings_and_inspector_tabs_visible(self) -> None:
+        self.app.setMinimumSize(960, 600)
+        self.app.resize(960, 600)
+        self.qt_app.processEvents()
+
+        checks = (
+            self.app.memory_check,
+            self.app.skills_check,
+            self.app.continue_check,
+        )
+        for check in checks:
+            self.assertGreaterEqual(
+                check.width(),
+                check.minimumSizeHint().width(),
+                f"{check.text()} is clipped at 960px",
+            )
+        for left, right in zip(checks, checks[1:]):
+            self.assertLess(left.geometry().right(), right.geometry().left())
+
+        tab_bar = self.app.inspector.tabBar()
+        self.assertFalse(tab_bar.usesScrollButtons())
+        self.assertEqual(
+            [tab_bar.tabText(index) for index in range(tab_bar.count())],
+            ["Info", "Diff", "Memory", "Skills"],
+        )
+        for index in range(tab_bar.count()):
+            label = tab_bar.tabText(index)
+            rect = tab_bar.tabRect(index)
+            self.assertGreaterEqual(
+                rect.width(),
+                tab_bar.fontMetrics().horizontalAdvance(label),
+                f"{label} text is clipped",
+            )
+            self.assertLessEqual(rect.right(), tab_bar.rect().right())
+
+        self.assertGreaterEqual(
+            self.app.main_splitter.sizes()[1],
+            self.app.center_splitter.minimumWidth(),
         )
 
     def test_workspace_files_are_a_read_only_left_sidebar(self) -> None:
@@ -1089,6 +1154,7 @@ class GuiWidgetTests(unittest.TestCase):
             state_dir=workspace / "state",
             wire_api="responses",
             memory_enabled=False,
+            skills_enabled=True,
         )
         with patch(
             "tinyforge.gui.QFileDialog.getExistingDirectory", return_value=str(workspace)
@@ -1099,6 +1165,7 @@ class GuiWidgetTests(unittest.TestCase):
         self.assertEqual(self.app.model_entry.text(), "workspace-model")
         self.assertEqual(self.app.protocol_combo.currentText(), "responses")
         self.assertFalse(self.app.memory_check.isChecked())
+        self.assertTrue(self.app.skills_check.isChecked())
         self.assertEqual(self.app._settings_workspace, workspace.resolve())
         self.assertEqual(self.app._files_workspace, workspace.resolve())
         self.assertFalse(self.app._settings_dirty)
@@ -1118,6 +1185,7 @@ class GuiWidgetTests(unittest.TestCase):
         self.app.model_entry.setText("explicit-model")
         self.app.protocol_combo.setCurrentText("responses")
         self.app.memory_check.setChecked(False)
+        self.app.skills_check.setChecked(True)
         self.app._mark_settings_dirty()
         self.app.task_input.setPlainText("Use my explicit settings")
         self.app._start_task()
@@ -1128,7 +1196,330 @@ class GuiWidgetTests(unittest.TestCase):
         self.assertEqual(captured[0].model, "explicit-model")
         self.assertEqual(captured[0].wire_api, "responses")
         self.assertFalse(captured[0].memory_enabled)
+        self.assertTrue(captured[0].skills_enabled)
         self.assertFalse(self.app.worker.is_running)
+
+    def test_skill_loaded_event_updates_inspector_once(self) -> None:
+        assert AgentEvent is not None
+        event = AgentEvent(
+            "skill_loaded",
+            {
+                "id": "workspace:verified-change",
+                "name": "verified-change",
+                "scope": "workspace",
+            },
+        )
+
+        self.app._render_agent_event(event)
+        self.app._render_agent_event(event)
+
+        self.assertEqual(self.app._loaded_skill_ids, {"workspace:verified-change"})
+        index = self.app.inspector.indexOf(self.app.skills_tab)
+        self.assertEqual(self.app.inspector.tabText(index), "Skills")
+        rows = [
+            self.app.timeline.topLevelItem(item).text(1)
+            for item in range(self.app.timeline.topLevelItemCount())
+        ]
+        self.assertEqual(rows.count("Skill"), 1)
+
+    def test_skill_adaptation_error_is_visible_redacted_and_read_only(self) -> None:
+        assert AgentEvent is not None
+        assert Qt is not None
+        secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+
+        self.app._render_agent_event(
+            AgentEvent(
+                "skill_adaptation_error",
+                {"error": f"Skill review failed for {secret}\x00"},
+            )
+        )
+
+        item = self.app.timeline.topLevelItem(self.app.timeline.topLevelItemCount() - 1)
+        item_id = item.data(0, Qt.ItemDataRole.UserRole)
+        details = self.app._entry_details[item_id]
+        self.assertEqual(item.text(0), "Failed")
+        self.assertEqual(item.text(1), "Skill review")
+        self.assertIn("Skill review failed", details)
+        self.assertNotIn(secret, details)
+        self.assertNotIn("\x00", details)
+        self.assertTrue(self.app.details_text.isReadOnly())
+
+    def test_loaded_receipt_digests_survive_snapshot_without_path_or_body(self) -> None:
+        assert AgentEvent is not None
+        skill_digest = "A" * 64
+        resource_digest = "B" * 64
+        loaded = {
+            "id": "workspace:verified-change",
+            "name": "verified-change",
+            "description": "Verify changes",
+            "scope": "workspace",
+            "sha256": skill_digest,
+            "resource_manifest_sha256": resource_digest,
+            "loaded_step": 4,
+            "path": "C:/private/SKILL.md",
+            "instructions": "SKILL_BODY_MUST_NOT_RENDER",
+        }
+        self.app._render_agent_event(AgentEvent("skill_loaded", loaded))
+
+        self.app._apply_skill_snapshot(
+            {
+                "state": "ready",
+                "enabled": True,
+                "available": [
+                    {
+                        "id": "workspace:verified-change",
+                        "name": "verified-change",
+                        "description": "Verify changes",
+                        "scope": "workspace",
+                    }
+                ],
+                "loaded": [
+                    {
+                        "id": "workspace:verified-change",
+                        "name": "verified-change",
+                        "description": "Verify changes",
+                        "scope": "workspace",
+                    }
+                ],
+                "receipts": [
+                    {
+                        "id": "workspace:verified-change",
+                        "sha256": skill_digest,
+                        "resource_manifest_sha256": resource_digest,
+                        "loaded_step": 4,
+                        "path": "C:/private/receipt.json",
+                        "content": "RECEIPT_BODY_MUST_NOT_RENDER",
+                    }
+                ],
+                "invalid_entries_skipped": 0,
+            }
+        )
+
+        loaded_group = next(
+            self.app.skill_tree.topLevelItem(index)
+            for index in range(self.app.skill_tree.topLevelItemCount())
+            if self.app.skill_tree.topLevelItem(index).text(0) == "Loaded"
+        )
+        loaded_item = loaded_group.child(0)
+        receipt_item = loaded_item.child(0)
+        self.assertEqual(receipt_item.text(0), "Receipt")
+        self.assertIn("sha256 aaaaaaaaaaaa", receipt_item.text(1))
+        self.assertIn("resources bbbbbbbbbbbb", receipt_item.text(1))
+        self.assertIn("sha256 aaaaaaaaaaaa", loaded_item.toolTip(1))
+        self.assertIn("resources bbbbbbbbbbbb", loaded_item.toolTip(1))
+        tree_text = self._skill_tree_text()
+        self.assertNotIn("C:/private", tree_text)
+        self.assertNotIn("SKILL_BODY_MUST_NOT_RENDER", tree_text)
+        self.assertNotIn("RECEIPT_BODY_MUST_NOT_RENDER", tree_text)
+
+    def test_skill_candidates_keep_result_order_and_hide_unexpected_fields(self) -> None:
+        assert AgentEvent is not None
+        self.app._apply_skill_snapshot(
+            {
+                "state": "ready",
+                "enabled": True,
+                "available": [
+                    {
+                        "id": "workspace:alpha",
+                        "name": "alpha",
+                        "description": "First catalog entry",
+                        "scope": "workspace",
+                        "path": "C:/private/alpha/SKILL.md",
+                        "instructions": "CATALOG_BODY_MUST_NOT_RENDER",
+                    }
+                ],
+                "loaded": [],
+                "invalid_entries_skipped": 2,
+            }
+        )
+        candidates = [
+            {
+                "id": f"workspace:skill-{index:02d}",
+                "name": f"skill-{index:02d}",
+                "description": f"Candidate {index}",
+                "scope": "workspace",
+                "path": "C:/private/SKILL.md",
+                "instructions": "CANDIDATE_BODY_MUST_NOT_RENDER",
+            }
+            for index in range(55)
+        ]
+        self.app._render_agent_event(
+            AgentEvent(
+                "skills_listed",
+                {
+                    "call_id": "search-1",
+                    "query": "verify change",
+                    "scope": "workspace",
+                    "skills": candidates,
+                    "invalid_entries_skipped": 2,
+                },
+            )
+        )
+        self.app._render_agent_event(
+            AgentEvent(
+                "skills_listed",
+                {
+                    "call_id": "search-from-task",
+                    "query": "",
+                    "query_source": "task",
+                    "scope": "any",
+                    "skills": [],
+                },
+            )
+        )
+
+        rendered = self.app._skill_searches[0]["skills"]
+        self.assertEqual(len(rendered), 50)
+        self.assertEqual(
+            [item["id"] for item in rendered[:3]],
+            ["workspace:skill-00", "workspace:skill-01", "workspace:skill-02"],
+        )
+        tree_text = self._skill_tree_text()
+        self.assertIn('query="verify change"', tree_text)
+        self.assertIn("current task · scope=any", tree_text)
+        self.assertIn("workspace:skill-00", tree_text)
+        self.assertNotIn("C:/private", tree_text)
+        self.assertNotIn("CATALOG_BODY_MUST_NOT_RENDER", tree_text)
+        self.assertNotIn("CANDIDATE_BODY_MUST_NOT_RENDER", tree_text)
+
+    def test_skill_load_order_and_resource_parent_are_stable(self) -> None:
+        assert AgentEvent is not None
+        first = AgentEvent(
+            "skill_loaded",
+            {"id": "workspace:first", "name": "first", "scope": "workspace"},
+        )
+        second = AgentEvent(
+            "skill_loaded",
+            {"id": "user:second", "name": "second", "scope": "user"},
+        )
+        self.app._render_agent_event(first)
+        self.app._render_agent_event(second)
+        self.app._render_agent_event(first)
+        self.app._render_agent_event(
+            AgentEvent(
+                "skill_resource_read",
+                {
+                    "call_id": "resource-1",
+                    "skill_id": "user:second",
+                    "path": "references/checklist.md",
+                    "start_line": 2,
+                    "end_line": 8,
+                    "total_lines": 20,
+                    "truncated": False,
+                },
+            )
+        )
+        self.app._render_agent_event(
+            AgentEvent(
+                "skill_resource_read",
+                {
+                    "call_id": "resource-outside",
+                    "skill_id": "workspace:first",
+                    "path": "../private.txt",
+                    "start_line": 1,
+                    "end_line": 1,
+                    "total_lines": 1,
+                },
+            )
+        )
+
+        self.assertEqual(
+            [item["id"] for item in self.app._loaded_skills],
+            ["workspace:first", "user:second"],
+        )
+        self.assertEqual(len(self.app._skill_resource_reads), 1)
+        loaded_group = next(
+            self.app.skill_tree.topLevelItem(index)
+            for index in range(self.app.skill_tree.topLevelItemCount())
+            if self.app.skill_tree.topLevelItem(index).text(0) == "Loaded"
+        )
+        self.assertEqual(loaded_group.child(0).childCount(), 0)
+        self.assertEqual(loaded_group.child(1).childCount(), 1)
+        self.assertIn("references/checklist.md", loaded_group.child(1).child(0).text(1))
+        self.assertNotIn("private.txt", self._skill_tree_text())
+
+    def test_new_skill_run_resets_evidence_and_new_context_resets_loaded_order(self) -> None:
+        assert AgentEvent is not None
+        self.app._skill_catalog = [
+            {
+                "id": "workspace:keep-catalog",
+                "name": "keep-catalog",
+                "description": "Catalog metadata",
+                "scope": "workspace",
+            }
+        ]
+        self.app._render_agent_event(
+            AgentEvent(
+                "skills_listed",
+                {"call_id": "search-old", "skills": [], "query": "old", "scope": "any"},
+            )
+        )
+        self.app._render_agent_event(
+            AgentEvent(
+                "skill_loaded",
+                {"id": "workspace:loaded", "name": "loaded", "scope": "workspace"},
+            )
+        )
+        self.app._skill_resource_reads.append(
+            {
+                "call_id": "resource-old",
+                "skill_id": "workspace:loaded",
+                "path": "references/old.md",
+                "start_line": 1,
+                "end_line": 1,
+                "total_lines": 1,
+                "truncated": False,
+            }
+        )
+        self.app._skill_fault_reports.append({"call_id": "fault-old"})
+
+        self.app._begin_skill_run(continue_session=True, enabled=True)
+        self.assertEqual([item["id"] for item in self.app._loaded_skills], ["workspace:loaded"])
+        self.assertEqual(self.app._skill_searches, [])
+        self.assertEqual(self.app._skill_resource_reads, [])
+        self.assertEqual(self.app._skill_fault_reports, [])
+
+        self.app._begin_skill_run(continue_session=False, enabled=True)
+        self.assertEqual(self.app._loaded_skills, [])
+        self.assertEqual(self.app._loaded_skill_ids, set())
+        self.assertEqual(self.app._skill_catalog[0]["id"], "workspace:keep-catalog")
+        self.app._begin_skill_run(continue_session=False, enabled=False)
+        self.assertEqual(self.app.skill_status_label.text(), "Disabled")
+
+    def test_skill_fault_report_is_a_read_only_unqualified_audit_record(self) -> None:
+        assert AgentEvent is not None
+        self.app._render_agent_event(
+            AgentEvent(
+                "skill_fault_report",
+                {
+                    "call_id": "failed-tool-1",
+                    "localized_step": 7,
+                    "tool": "edit_file",
+                    "observation": "Patch verification failed",
+                    "active_skill_candidates": [
+                        {
+                            "id": "workspace:verified-change",
+                            "sha256": "a" * 64,
+                            "loaded_step": 3,
+                        }
+                    ],
+                    "attribution_status": "unresolved",
+                    "qualification_status": "not_run",
+                    "skill_mutation_applied": False,
+                    "trace_truncated": True,
+                },
+            )
+        )
+
+        tree_text = self._skill_tree_text()
+        self.assertIn("Adaptation", tree_text)
+        self.assertIn("step 7 · edit_file · trace clipped", tree_text)
+        self.assertIn("unresolved", tree_text)
+        self.assertIn("not_run", tree_text)
+        self.assertIn("not applied", tree_text)
+        self.assertIn("workspace:verified-change", tree_text)
+        self.assertNotIn("Apply update", tree_text)
+        self.assertEqual(len(self.app._skill_fault_reports), 1)
 
     def test_destroy_stops_queue_timer(self) -> None:
         timer = self.app._drain_timer

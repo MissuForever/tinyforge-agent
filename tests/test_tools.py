@@ -72,6 +72,29 @@ class WorkspaceToolsTests(unittest.TestCase):
         self.assertEqual(result["result"]["exit_code"], 0)
         self.assertIn("42", result["result"]["stdout"])
 
+    def test_command_does_not_inherit_agent_provider_credentials(self) -> None:
+        (self.root / "inspect_environment.py").write_text(
+            "import os\n"
+            "print(os.environ.get('OPENAI_API_KEY', 'missing'))\n"
+            "print(os.environ.get('TINYFORGE_API_KEY', 'missing'))\n"
+            "print(os.environ.get('TINYFORGE_TEST_PASSTHROUGH', 'missing'))\n",
+            encoding="utf-8",
+        )
+        environment = {
+            "OPENAI_API_KEY": "openai-agent-secret",
+            "TINYFORGE_API_KEY": "tinyforge-agent-secret",
+            "TINYFORGE_TEST_PASSTHROUGH": "visible",
+        }
+
+        with patch.dict(os.environ, environment, clear=False):
+            result = self.execute(
+                "run_command",
+                command=self._python_command("inspect_environment.py"),
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["result"]["stdout"].splitlines(), ["missing", "missing", "visible"])
+
     @unittest.skipUnless(os.name == "nt", "Windows Job Objects are Windows-only")
     def test_windows_command_joins_job_before_suspended_process_resumes(self) -> None:
         jobs: list[bool] = []
@@ -487,6 +510,77 @@ class WorkspaceToolsTests(unittest.TestCase):
         result = self.execute("run_command", command="git reset --hard HEAD")
         self.assertFalse(result["ok"])
         self.assertIn("blocked by safety policy", result["error"])
+
+    def test_privilege_escalation_tokens_are_blocked_as_commands(self) -> None:
+        commands = (
+            "sudo apt-get update",
+            "/usr/bin/sudo -u root whoami",
+            "su - root",
+            "su --login root",
+            "Write-Output ready; sudo whoami",
+            'powershell -Command "sudo whoami"',
+        )
+
+        for command in commands:
+            with self.subTest(command=command):
+                result = self.execute("run_command", command=command)
+                self.assertFalse(result["ok"])
+                self.assertIn("privilege escalation", result["error"])
+
+    def test_system_critical_mutations_are_blocked_without_execution(self) -> None:
+        commands = (
+            "rm -f /etc/passwd",
+            "unlink /usr/bin/python",
+            r"Remove-Item -LiteralPath C:\Windows\System32\kernel32.dll",
+            r"Set-Content -Path $env:SystemRoot\System32\drivers\etc\hosts -Value blocked",
+            "Write-Output blocked > /etc/tinyforge-policy-test",
+        )
+
+        for command in commands:
+            with self.subTest(command=command):
+                result = self.execute("run_command", command=command)
+                self.assertFalse(result["ok"])
+                self.assertIn("system-critical path modification", result["error"])
+
+    def test_dangerous_words_in_output_text_do_not_trigger_policy(self) -> None:
+        commands = (
+            'echo "sudo rm -rf /"',
+            'Write-Output "su --login root"',
+            r"Write-Output 'Remove-Item C:\Windows -Recurse'",
+            'git commit -m "git reset --hard is not being executed"',
+            'python -c "print(\'sudo rm -f /etc/passwd\')"',
+        )
+
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertIsNone(WorkspaceTools._danger_reason(command))
+
+    def test_allow_dangerous_bypasses_command_policy_check(self) -> None:
+        script = self.root / "allowed.py"
+        script.write_text("print('allowed')\n", encoding="utf-8")
+        permissive = WorkspaceTools(
+            self.root,
+            command_timeout=5,
+            max_output=10_000,
+            allow_dangerous=True,
+        )
+
+        with patch.object(
+            WorkspaceTools,
+            "_danger_reason",
+            side_effect=AssertionError("explicit opt-in must bypass the default policy"),
+        ) as policy:
+            payload = json.loads(
+                permissive.execute(
+                    "run_command",
+                    json.dumps({"command": self._python_command(script.name)}),
+                )
+            )
+
+        policy.assert_not_called()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["result"]["exit_code"], 0)
+        self.assertIn("allowed", payload["result"]["stdout"])
 
     def test_invalid_json_does_not_raise(self) -> None:
         result = json.loads(self.tools.execute("read_file", "{not-json"))

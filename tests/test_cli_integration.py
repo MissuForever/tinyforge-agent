@@ -111,6 +111,9 @@ class CliIntegrationTests(unittest.TestCase):
                         "--workspace",
                         workspace,
                         "--no-memory",
+                        "--skills",
+                        "--skills-dir",
+                        str(Path(workspace) / "user-skills"),
                         "Create from_http.txt",
                     ],
                     cwd=project_root,
@@ -127,7 +130,16 @@ class CliIntegrationTests(unittest.TestCase):
                 self.assertEqual(generated.read_text(encoding="utf-8"), "HTTP loop works\n")
                 self.assertIn("[tool] write_file", completed.stdout)
                 self.assertIn("[final] Created from_http.txt successfully.", completed.stdout)
+                self.assertIn("skills=on", completed.stdout)
                 self.assertEqual(len(ScriptedHandler.requests), 2)
+                first_tool_names = {
+                    item["function"]["name"]
+                    for item in ScriptedHandler.requests[0]["tools"]
+                }
+                self.assertTrue(
+                    {"list_skills", "load_skill", "read_skill_resource"}
+                    <= first_tool_names
+                )
                 second_messages = ScriptedHandler.requests[1]["messages"]
                 self.assertEqual(second_messages[-1]["role"], "tool")
                 self.assertTrue(json.loads(second_messages[-1]["content"])["ok"])
@@ -179,7 +191,12 @@ class CliIntegrationTests(unittest.TestCase):
                 self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
                 self.assertEqual(generated.read_text(encoding="utf-8"), "Responses loop works\n")
                 self.assertIn("[final] Responses task complete.", completed.stdout)
+                self.assertIn("skills=off", completed.stdout)
                 self.assertEqual(ScriptedHandler.paths, ["/v1/responses", "/v1/responses"])
+                response_tool_names = {
+                    item["name"] for item in ScriptedHandler.requests[0]["tools"]
+                }
+                self.assertNotIn("list_skills", response_tool_names)
                 self.assertEqual(ScriptedHandler.requests[0]["reasoning"], {"effort": "xhigh"})
                 self.assertFalse(ScriptedHandler.requests[0]["store"])
                 second_input = ScriptedHandler.requests[1]["input"]

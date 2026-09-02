@@ -9,6 +9,7 @@ import json
 import os
 import re
 import select
+import shlex
 import signal
 import subprocess
 import sys
@@ -20,6 +21,345 @@ from typing import Any, Callable
 
 
 ToolProgressHandler = Callable[[str, str], None]
+
+
+_COMMAND_SEPARATORS = {";", "|", "||", "&&"}
+_REDIRECT_OPERATORS = {">", ">>"}
+_EXECUTABLE_SUFFIXES = (".exe", ".com", ".cmd", ".bat")
+
+
+def _shell_tokens(command: str) -> list[str]:
+    """Tokenize common sh and PowerShell syntax for conservative policy checks."""
+    lexer = shlex.shlex(command, posix=False, punctuation_chars=";&|<>\r\n")
+    lexer.commenters = ""
+    lexer.whitespace = " \t"
+    lexer.whitespace_split = True
+    try:
+        raw_tokens = list(lexer)
+    except ValueError:
+        return [command]
+    tokens = []
+    for token in raw_tokens:
+        if token and all(character in "\r\n" for character in token):
+            tokens.append(";")
+        elif len(token) >= 2 and token[0] == token[-1] and token[0] in {"'", '"'}:
+            tokens.append(token[1:-1])
+        else:
+            tokens.append(token)
+    return tokens
+
+
+def _command_segments(command: str) -> list[list[str]]:
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in _shell_tokens(command):
+        separator = token in _COMMAND_SEPARATORS or token == "&" and bool(current)
+        if separator:
+            if current:
+                segments.append(current)
+                current = []
+            continue
+        current.append(token)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _command_name(token: str) -> str:
+    name = token.replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    for suffix in _EXECUTABLE_SUFFIXES:
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def _executable_and_arguments(segment: list[str]) -> tuple[str, list[str]]:
+    index = 0
+    while index < len(segment) and segment[index] == "&":
+        index += 1
+    while index < len(segment) and re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_]*=.*", segment[index]
+    ):
+        index += 1
+    if index >= len(segment):
+        return "", []
+
+    name = _command_name(segment[index])
+    if name == "env":
+        index += 1
+        while index < len(segment) and (
+            segment[index].startswith("-")
+            or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", segment[index])
+        ):
+            index += 1
+        if index >= len(segment):
+            return "", []
+        name = _command_name(segment[index])
+    elif name in {"command", "builtin", "nohup"}:
+        index += 1
+        while index < len(segment) and segment[index].startswith("-"):
+            index += 1
+        if index >= len(segment):
+            return "", []
+        name = _command_name(segment[index])
+    return name, segment[index + 1 :]
+
+
+def _critical_system_target(value: str) -> bool:
+    target = value.strip().strip(",").casefold().replace("\\", "/")
+    if target.startswith("file://"):
+        target = target[7:]
+    if target.startswith("//?/"):
+        target = target[4:]
+    windows_environment_roots = (
+        "%systemroot%",
+        "%windir%",
+        "$env:systemroot",
+        "${env:systemroot}",
+        "$env:windir",
+        "${env:windir}",
+    )
+    if target.startswith(windows_environment_roots):
+        return True
+    if target.startswith(("//./physicaldrive", "//?/physicaldrive")):
+        return True
+    if re.match(r"^[a-z]:(?:/)?(?:$|[*?])", target):
+        return True
+    if re.match(
+        r"^[a-z]:/(?:windows|program files(?: \(x86\))?|programdata)"
+        r"(?:/|$|[*?\[])",
+        target,
+    ):
+        return True
+    if re.match(
+        r"^/(?:windows|program files(?: \(x86\))?|programdata)(?:/|$|[*?\[])",
+        target,
+    ):
+        return True
+    if target in {"/", "/*", "/.*"}:
+        return True
+    if re.match(
+        r"^/(?:bin|boot|dev|etc|lib(?:32|64)?|proc|root|sbin|sys|usr)"
+        r"(?:/|$|[*?\[])",
+        target,
+    ):
+        return True
+    return bool(
+        re.match(
+            r"^/(?:system|library|applications|private/etc|private/var/db|"
+            r"var/(?:lib|log|spool))(?:/|$|[*?\[])",
+            target,
+        )
+    )
+
+
+def _redirect_targets(segment: list[str]) -> list[str]:
+    return [
+        segment[index + 1]
+        for index, token in enumerate(segment[:-1])
+        if token in _REDIRECT_OPERATORS
+    ]
+
+
+def _mutation_targets(name: str, arguments: list[str]) -> list[str]:
+    target_options = {
+        "-destination",
+        "-filepath",
+        "-literalpath",
+        "-path",
+    }
+    value_options = {
+        "-credential",
+        "-encoding",
+        "-exclude",
+        "-filter",
+        "-include",
+        "-stream",
+        "-value",
+    }
+    named_targets: list[str] = []
+    positional: list[str] = []
+    skip_value = False
+    for index, argument in enumerate(arguments):
+        lowered = argument.casefold()
+        if skip_value:
+            skip_value = False
+            continue
+        if lowered in target_options and index + 1 < len(arguments):
+            named_targets.append(arguments[index + 1])
+            skip_value = True
+            continue
+        option, separator, _ = lowered.partition(":")
+        if separator and option in target_options:
+            named_targets.append(argument.split(":", 1)[1])
+            continue
+        if lowered in value_options:
+            skip_value = True
+            continue
+        if lowered.startswith("of=") and name == "dd":
+            named_targets.append(argument[3:])
+            continue
+        if argument in _REDIRECT_OPERATORS or argument.startswith(("-", "/")):
+            if not _critical_system_target(argument):
+                continue
+        positional.append(argument)
+
+    if named_targets:
+        return named_targets
+    if name in {"set-content", "add-content", "out-file", "new-item", "ac", "ni"}:
+        return positional[:1]
+    if name in {"copy-item", "cpi", "cp", "copy", "install"}:
+        return positional[-1:]
+    return positional
+
+
+def _git_subcommand(arguments: list[str]) -> tuple[str, list[str]]:
+    index = 0
+    options_with_values = {"-c", "-C", "--git-dir", "--work-tree", "--namespace"}
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in options_with_values:
+            index += 2
+            continue
+        if argument.startswith("-"):
+            index += 1
+            continue
+        return argument.casefold(), arguments[index + 1 :]
+    return "", []
+
+
+def _nested_shell_reason(name: str, arguments: list[str], depth: int) -> str | None:
+    shell_options = {
+        "bash": {"-c", "-lc"},
+        "cmd": {"/c", "/k"},
+        "dash": {"-c"},
+        "eval": set(),
+        "iex": set(),
+        "invoke-expression": set(),
+        "ksh": {"-c"},
+        "powershell": {"-c", "-command"},
+        "pwsh": {"-c", "-command"},
+        "sh": {"-c", "-lc"},
+        "zsh": {"-c"},
+    }
+    if name not in shell_options or depth >= 2:
+        return None
+    accepted = shell_options[name]
+    if not accepted:
+        nested = " ".join(arguments)
+    else:
+        option_index = next(
+            (
+                index
+                for index, argument in enumerate(arguments)
+                if argument.casefold() in accepted
+            ),
+            -1,
+        )
+        if option_index < 0:
+            return None
+        nested = " ".join(arguments[option_index + 1 :])
+    return _dangerous_command_reason(nested, depth + 1) if nested else None
+
+
+def _dangerous_command_reason(command: str, depth: int = 0) -> str | None:
+    # This is a default guardrail, not a shell sandbox or complete command interpreter.
+    mutation_commands = {
+        "ac",
+        "add-content",
+        "chgrp",
+        "chmod",
+        "chown",
+        "clear-content",
+        "clc",
+        "copy",
+        "copy-item",
+        "cp",
+        "cpi",
+        "dd",
+        "del",
+        "erase",
+        "format",
+        "install",
+        "mkfs",
+        "move",
+        "move-item",
+        "mv",
+        "new-item",
+        "ni",
+        "out-file",
+        "rd",
+        "remove-item",
+        "ri",
+        "rm",
+        "rmdir",
+        "set-content",
+        "shred",
+        "tee",
+        "touch",
+        "truncate",
+        "unlink",
+    }
+    for segment in _command_segments(command):
+        name, arguments = _executable_and_arguments(segment)
+        if not name:
+            continue
+        if name in {"sudo", "su"}:
+            return "privilege escalation"
+
+        nested_reason = _nested_shell_reason(name, arguments, depth)
+        if nested_reason:
+            return nested_reason
+
+        lowered_arguments = [argument.casefold() for argument in arguments]
+        if name == "git":
+            subcommand, subcommand_arguments = _git_subcommand(arguments)
+            lowered_subcommand_arguments = [
+                argument.casefold() for argument in subcommand_arguments
+            ]
+            if subcommand == "reset" and "--hard" in lowered_subcommand_arguments:
+                return "git history/worktree destruction"
+            if subcommand == "clean":
+                return "untracked-file deletion"
+            if subcommand == "push" and any(
+                argument == "-f" or argument.startswith("--force")
+                for argument in lowered_subcommand_arguments
+            ):
+                return "forced remote history rewrite"
+        if name == "rm":
+            short_flags = "".join(
+                argument[1:]
+                for argument in lowered_arguments
+                if argument.startswith("-") and not argument.startswith("--")
+            )
+            recursive = "r" in short_flags or "--recursive" in lowered_arguments
+            forced = "f" in short_flags or "--force" in lowered_arguments
+            if recursive and forced:
+                return "recursive forced deletion"
+        if name in {"rmdir", "rd"} and "/s" in lowered_arguments:
+            return "recursive deletion"
+        if name in {"del", "erase"} and any(
+            argument in {"/s", "/q"} for argument in lowered_arguments
+        ):
+            return "bulk deletion"
+        if name in {"remove-item", "ri"} and any(
+            argument.startswith("-recurse") for argument in lowered_arguments
+        ):
+            return "recursive deletion"
+        if name == "format" and any(re.fullmatch(r"[a-z]:", arg) for arg in arguments):
+            return "disk formatting"
+        if name in {"shutdown", "reboot", "restart-computer"}:
+            return "machine shutdown/restart"
+        if name == "diskpart":
+            return "disk partition modification"
+
+        if any(_critical_system_target(target) for target in _redirect_targets(segment)):
+            return "system-critical path modification"
+        if name in mutation_commands and any(
+            _critical_system_target(target) for target in _mutation_targets(name, arguments)
+        ):
+            return "system-critical path modification"
+    return None
 
 
 class ToolError(RuntimeError):
@@ -629,6 +969,9 @@ class WorkspaceTools:
             creation_flags = 0
             suspended_flag = 0
         environment = os.environ.copy()
+        # Provider credentials belong to the Agent process, not commands proposed by the model.
+        environment.pop("OPENAI_API_KEY", None)
+        environment.pop("TINYFORGE_API_KEY", None)
         environment.setdefault("PYTHONIOENCODING", "utf-8")
         process = subprocess.Popen(
             invocation,
@@ -912,20 +1255,4 @@ class WorkspaceTools:
 
     @staticmethod
     def _danger_reason(command: str) -> str | None:
-        normalized = " ".join(command.lower().split())
-        patterns = (
-            (r"\bgit\s+reset\s+--hard\b", "git history/worktree destruction"),
-            (r"\bgit\s+clean\b", "untracked-file deletion"),
-            (r"\bgit\s+push\b.*(?:--force|-f\b)", "forced remote history rewrite"),
-            (r"\brm\s+-(?:\w*r\w*f|\w*f\w*r)\b", "recursive forced deletion"),
-            (r"\brmdir\s+/s\b", "recursive deletion"),
-            (r"\bdel\s+/(?:s|q)\b", "bulk deletion"),
-            (r"\bremove-item\b.*\s-recurse\b", "recursive deletion"),
-            (r"\bformat(?:\.com)?\s+[a-z]:", "disk formatting"),
-            (r"\b(?:shutdown|reboot|restart-computer)\b", "machine shutdown/restart"),
-            (r"\bdiskpart\b", "disk partition modification"),
-        )
-        for pattern, reason in patterns:
-            if re.search(pattern, normalized, flags=re.IGNORECASE):
-                return reason
-        return None
+        return _dangerous_command_reason(command)

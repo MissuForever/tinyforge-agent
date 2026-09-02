@@ -57,6 +57,9 @@ class BlockingAgent:
     def memory_overview(self):
         return "persistent_memory_index: empty"
 
+    def skills_overview(self):
+        return "skills: enabled; available=1; loaded=0"
+
 
 class GuiSupportTests(unittest.TestCase):
     def _config(self, workspace: Path) -> Config:
@@ -193,9 +196,14 @@ class GuiSupportTests(unittest.TestCase):
                 return agent
 
             worker = AgentWorker(events, builder=builder)
+            self.assertEqual(
+                worker.skills_overview(expected_workspace=workspace),
+                "Skills have not been loaded for this workspace.",
+            )
             run_id = worker.start(self._config(workspace), "First task", continue_session=False)
             self.assertIsNotNone(run_id)
             self.assertTrue(agents[0].started.wait(1))
+            self.assertIn("after the current task", worker.skills_overview())
             self.assertIsNone(
                 worker.start(self._config(workspace), "Second task", continue_session=True)
             )
@@ -214,6 +222,10 @@ class GuiSupportTests(unittest.TestCase):
             )
             self.assertTrue(worker.acknowledge_terminal(run_id))
             self.assertFalse(worker.is_running)
+            self.assertEqual(
+                worker.skills_overview(expected_workspace=workspace),
+                "skills: enabled; available=1; loaded=0",
+            )
 
     def test_worker_cancel_is_forwarded_to_agent(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

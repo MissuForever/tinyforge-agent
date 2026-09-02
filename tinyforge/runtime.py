@@ -6,6 +6,7 @@ from .agent import Agent, EventHandler
 from .config import Config
 from .memory import MemoryRuntime, MemoryStore
 from .model import OpenAICompatibleClient
+from .skills import SkillCatalog, SkillRuntime
 from .tools import CompositeTools, WorkspaceTools
 
 
@@ -27,7 +28,7 @@ def build_agent(config: Config, *, on_event: EventHandler | None = None) -> Agen
         allow_dangerous=config.allow_dangerous,
     )
     memory = None
-    tools = workspace_tools
+    providers = [workspace_tools]
     if config.memory_enabled:
         memory = MemoryRuntime(
             MemoryStore(
@@ -36,7 +37,14 @@ def build_agent(config: Config, *, on_event: EventHandler | None = None) -> Agen
                 archive_sessions=config.archive_sessions,
             )
         )
-        tools = CompositeTools(workspace_tools, memory)
+        providers.append(memory)
+    skills = SkillRuntime(
+        SkillCatalog(config.workspace, config.user_skills_dir),
+        enabled=config.skills_enabled,
+    )
+    if config.skills_enabled:
+        providers.append(skills)
+    tools = providers[0] if len(providers) == 1 else CompositeTools(*providers)
     return Agent(
         model=model,
         tools=tools,
@@ -46,4 +54,6 @@ def build_agent(config: Config, *, on_event: EventHandler | None = None) -> Agen
         max_context_tokens=config.max_context_tokens,
         on_event=on_event,
         memory=memory,
+        skills=skills,
+        skills_enabled=config.skills_enabled,
     )

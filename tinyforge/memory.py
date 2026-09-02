@@ -431,7 +431,14 @@ class WorkingMemory:
         }
 
     def record_tool(self, name: str, output: str) -> None:
-        if name in {"update_working_checkpoint", "recall_memory", "stage_memory"}:
+        if name in {
+            "update_working_checkpoint",
+            "recall_memory",
+            "stage_memory",
+            "list_skills",
+            "load_skill",
+            "read_skill_resource",
+        }:
             return
         self.sequence += 1
         try:

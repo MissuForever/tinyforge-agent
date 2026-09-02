@@ -65,6 +65,23 @@ class Console:
             )
         elif event.kind == "memory_error":
             print(self.paint(f"[memory error] {event.data['error']}", "red"))
+        elif event.kind == "skill_loaded":
+            print(self.paint(f"[skill] loaded {event.data['id']}", "green"))
+        elif event.kind == "skill_fault_report":
+            candidates = event.data.get("active_skill_candidates", [])
+            candidate_ids = ", ".join(
+                str(item.get("id", ""))
+                for item in candidates
+                if isinstance(item, dict) and item.get("id")
+            ) or "none"
+            print(
+                self.paint("[skill review]", "yellow"),
+                f"observable failure at step {event.data.get('localized_step', '?')} "
+                f"({event.data.get('tool', 'tool')}); active candidates={candidate_ids}; "
+                "attribution unresolved, no Skill changed",
+            )
+        elif event.kind == "skill_adaptation_error":
+            print(self.paint(f"[skill review error] {event.data['error']}", "red"))
 
     @staticmethod
     def _tool_summary(output: str) -> tuple[bool, str]:
@@ -122,6 +139,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-rounds", type=int, help="Maximum model/tool rounds")
     parser.add_argument("--tool-timeout", type=int, help="Default command timeout in seconds")
     parser.add_argument("--state-dir", help="Persistent state directory (default: ~/.tinyforge)")
+    parser.add_argument(
+        "--skills-dir",
+        help="User Skill directory (default: ~/.tinyforge/skills; never read from workspace .env)",
+    )
     parser.add_argument("--no-memory", action="store_true", help="Disable persistent memory")
     parser.add_argument(
         "--no-session-archive",
@@ -133,6 +154,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow commands blocked by the default destructive-command policy",
     )
+    skills_group = parser.add_mutually_exclusive_group()
+    skills_group.add_argument(
+        "--skills",
+        dest="skills_enabled",
+        action="store_true",
+        help="Enable read-only user and workspace Skills for this session",
+    )
+    skills_group.add_argument(
+        "--no-skills",
+        dest="skills_enabled",
+        action="store_false",
+        help="Disable Skills for this session",
+    )
+    parser.set_defaults(skills_enabled=None)
     parser.add_argument("--quiet", action="store_true", help="Hide intermediate assistant notes")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
     parser.add_argument("--version", action="version", version=f"TinyForge {__version__}")
@@ -149,15 +184,22 @@ def create_agent(args: argparse.Namespace, console: Console) -> Agent:
         "tool_timeout": args.tool_timeout,
         "allow_dangerous": args.allow_dangerous,
         "state_dir": Path(args.state_dir).expanduser().resolve() if args.state_dir else None,
+        "user_skills_dir": (
+            Path(args.skills_dir).expanduser().resolve(strict=False)
+            if args.skills_dir
+            else None
+        ),
         "memory_enabled": False if args.no_memory else None,
         "archive_sessions": False if args.no_session_archive else None,
+        "skills_enabled": args.skills_enabled,
     }
     config = Config.from_env(args.workspace, **overrides)
     print(
         console.paint("TinyForge", "cyan"),
         console.paint(
             f"model={config.model} api={config.wire_api} "
-            f"memory={'on' if config.memory_enabled else 'off'} workspace={config.workspace}",
+            f"memory={'on' if config.memory_enabled else 'off'} "
+            f"skills={'on' if config.skills_enabled else 'off'} workspace={config.workspace}",
             "dim",
         ),
     )
@@ -165,7 +207,7 @@ def create_agent(args: argparse.Namespace, console: Console) -> Agent:
 
 
 def interactive(agent: Agent, console: Console) -> int:
-    print("Enter a programming task. Commands: /new, /memory, /help, /exit")
+    print("Enter a programming task. Commands: /new, /memory, /skills, /help, /exit")
     continuing = False
     while True:
         try:
@@ -185,11 +227,14 @@ def interactive(agent: Agent, console: Console) -> int:
         if task == "/help":
             print(
                 "/new clears conversation context; /memory shows the working and persistent "
-                "memory index; /exit closes TinyForge."
+                "memory index; /skills shows the local Skill catalog; /exit closes TinyForge."
             )
             continue
         if task == "/memory":
             print(agent.memory_overview())
+            continue
+        if task == "/skills":
+            print(agent.skills_overview())
             continue
         result = agent.run(task, continue_session=continuing)
         continuing = True

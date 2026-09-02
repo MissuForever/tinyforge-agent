@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 
@@ -74,6 +74,16 @@ def _default_state_dir() -> Path:
         return Path.cwd() / ".tinyforge-state"
 
 
+def _default_user_skills_dir() -> Path:
+    configured = os.environ.get("TINYFORGE_SKILLS_DIR")
+    if configured:
+        return Path(configured).expanduser().resolve(strict=False)
+    try:
+        return (Path.home() / ".tinyforge" / "skills").resolve(strict=False)
+    except RuntimeError:
+        return (Path.cwd() / ".tinyforge-user-skills").resolve(strict=False)
+
+
 @dataclass(frozen=True, slots=True)
 class Config:
     api_key: str
@@ -81,6 +91,7 @@ class Config:
     model: str
     workspace: Path
     state_dir: Path
+    user_skills_dir: Path = field(default_factory=_default_user_skills_dir)
     wire_api: str = "chat_completions"
     reasoning_effort: str | None = None
     store_responses: bool = False
@@ -93,17 +104,19 @@ class Config:
     allow_dangerous: bool = False
     memory_enabled: bool = True
     archive_sessions: bool = True
+    skills_enabled: bool = False
 
     @classmethod
     def from_env(cls, workspace: str | Path = ".", **overrides: object) -> "Config":
         root = Path(workspace).expanduser().resolve()
         launch_directory = Path.cwd().resolve()
+        process_environment = dict(os.environ)
         file_environment = read_env_file(launch_directory / ".env")
         if root != launch_directory:
             for key, value in read_env_file(root / ".env").items():
                 file_environment.setdefault(key, value)
         environment = dict(file_environment)
-        environment.update(os.environ)
+        environment.update(process_environment)
 
         api_key = environment.get("TINYFORGE_API_KEY") or environment.get("OPENAI_API_KEY") or ""
         base_url = (
@@ -129,6 +142,10 @@ class Config:
             model=model,
             workspace=root,
             state_dir=state_dir,
+            user_skills_dir=Path(
+                process_environment.get("TINYFORGE_SKILLS_DIR")
+                or _default_user_skills_dir()
+            ).expanduser().resolve(strict=False),
             wire_api=wire_api,
             reasoning_effort=environment.get("TINYFORGE_REASONING_EFFORT") or None,
             store_responses=_env_bool(environment, "TINYFORGE_STORE_RESPONSES", False),
@@ -146,6 +163,9 @@ class Config:
             ),
             memory_enabled=_env_bool(environment, "TINYFORGE_MEMORY_ENABLED", True),
             archive_sessions=_env_bool(environment, "TINYFORGE_ARCHIVE_SESSIONS", True),
+            skills_enabled=_env_bool(
+                process_environment, "TINYFORGE_SKILLS_ENABLED", False
+            ),
         )
         known_overrides = {key: value for key, value in overrides.items() if value is not None}
         if known_overrides:

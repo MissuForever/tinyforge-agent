@@ -192,6 +192,9 @@ class TinyForgeApp(QMainWindow):
     TERMINAL_TRIM_CHARS = 160_000
     MAX_TERMINAL_CHUNK_CHARS = 40_000
     MAX_FILE_SEARCH_RESULTS = 500
+    MAX_SKILL_SEARCHES = 20
+    MAX_SKILL_RESOURCE_READS = 100
+    MAX_SKILL_FAULT_REPORTS = 20
     FILE_PATH_ROLE = int(Qt.ItemDataRole.UserRole)
     FILE_KIND_ROLE = FILE_PATH_ROLE + 1
     FILE_LOADED_ROLE = FILE_PATH_ROLE + 2
@@ -263,6 +266,20 @@ class TinyForgeApp(QMainWindow):
         self._current_task_text = ""
         self._change_count = 0
         self._memory_commit_count = 0
+        self._loaded_skill_ids: set[str] = set()
+        self._skill_catalog: list[dict[str, str]] = []
+        self._skill_searches: list[dict[str, Any]] = []
+        self._loaded_skills: list[dict[str, Any]] = []
+        self._skill_resource_reads: list[dict[str, Any]] = []
+        self._skill_fault_reports: list[dict[str, Any]] = []
+        self._skill_search_call_ids: set[str] = set()
+        self._skill_resource_call_ids: set[str] = set()
+        self._skill_fault_call_ids: set[str] = set()
+        self._skill_state = "not_loaded"
+        self._skill_enabled = preview_config.skills_enabled if preview_config else False
+        self._skill_invalid_count = 0
+        self._skill_rounds = 0
+        self._skill_tokens = 0
         self._item_sequence = 0
         self._terminal_commands: dict[str, _TerminalCommandState] = {}
         self._terminal_command_count = 0
@@ -323,8 +340,10 @@ class TinyForgeApp(QMainWindow):
             initial_model=initial_model,
             initial_wire_api=initial_wire_api,
             memory_enabled=preview_config.memory_enabled if preview_config else True,
+            skills_enabled=preview_config.skills_enabled if preview_config else False,
         )
         self._set_memory_text("Memory has not been loaded for this workspace.")
+        self._reset_skill_activity(clear_catalog=True, state="not_loaded")
         self._set_details_text("Select an execution step to inspect its evidence.")
         self._set_changes_text("No file changes captured.")
         self._reset_files(initial_workspace)
@@ -393,6 +412,14 @@ class TinyForgeApp(QMainWindow):
             }}
             QLabel#PanelTitle {{ font-size: 11pt; font-weight: 700; color: #293239; }}
             QLabel#PanelMeta {{ color: {self.COLORS['muted']}; font-size: 8.5pt; }}
+            QWidget#SkillsSummary {{
+                background: #f7f9f9; border-bottom: 1px solid {self.COLORS['border']};
+            }}
+            QLabel#SkillStatus {{ color: #293239; font-weight: 700; }}
+            QLabel#SkillStatus[tone="running"] {{ color: {self.COLORS['running']}; }}
+            QLabel#SkillStatus[tone="success"] {{ color: {self.COLORS['success']}; }}
+            QLabel#SkillStatus[tone="warning"] {{ color: {self.COLORS['warning']}; }}
+            QLabel#SkillMetrics {{ color: {self.COLORS['muted']}; font-size: 8.5pt; }}
             QTreeWidget {{
                 background: #ffffff; alternate-background-color: #fafbfb; border: 0;
                 outline: 0; show-decoration-selected: 1;
@@ -430,6 +457,7 @@ class TinyForgeApp(QMainWindow):
                 background: #ffffff; border-bottom: 1px solid {self.COLORS['border']};
             }}
             QTreeWidget#FilesTree::item {{ height: 28px; border-bottom: 0; }}
+            QTreeWidget#SkillsTree::item {{ height: 30px; }}
             QLabel#FilePath {{
                 color: #293239; font-family: "Cascadia Mono", Consolas;
                 font-size: 9pt; font-weight: 600;
@@ -456,6 +484,7 @@ class TinyForgeApp(QMainWindow):
         initial_model: str,
         initial_wire_api: str,
         memory_enabled: bool,
+        skills_enabled: bool,
     ) -> None:
         canvas = QWidget(self)
         canvas.setObjectName("AppCanvas")
@@ -466,7 +495,11 @@ class TinyForgeApp(QMainWindow):
         outer.addWidget(self._build_top_bar())
         outer.addWidget(
             self._build_settings_bar(
-                initial_workspace, initial_model, initial_wire_api, memory_enabled
+                initial_workspace,
+                initial_model,
+                initial_wire_api,
+                memory_enabled,
+                skills_enabled,
             )
         )
         content = QWidget()
@@ -553,7 +586,12 @@ class TinyForgeApp(QMainWindow):
         return container
 
     def _build_settings_bar(
-        self, workspace: Path, model: str, wire_api: str, memory_enabled: bool
+        self,
+        workspace: Path,
+        model: str,
+        wire_api: str,
+        memory_enabled: bool,
+        skills_enabled: bool,
     ) -> QWidget:
         bar = QFrame()
         bar.setObjectName("SettingsBar")
@@ -588,9 +626,18 @@ class TinyForgeApp(QMainWindow):
         self.memory_check = QCheckBox("Memory")
         self.memory_check.setChecked(memory_enabled)
         self.memory_check.toggled.connect(self._mark_settings_dirty)
-        self.continue_check = QCheckBox("Continue context")
+        self.skills_check = QCheckBox("Skills")
+        self.skills_check.setChecked(skills_enabled)
+        self.skills_check.setToolTip(
+            "Allow this session to discover and load read-only user and workspace Skills"
+        )
+        self.skills_check.toggled.connect(self._mark_settings_dirty)
+        self.continue_check = QCheckBox("Continue")
         self.continue_check.setChecked(True)
+        self.continue_check.setToolTip("Continue the existing conversation context")
+        self.continue_check.setAccessibleName("Continue context")
         checks_layout.addWidget(self.memory_check)
+        checks_layout.addWidget(self.skills_check)
         checks_layout.addWidget(self.continue_check)
         layout.addWidget(workspace_field, 0, 0)
         layout.addWidget(self.browse_button, 0, 1, Qt.AlignmentFlag.AlignBottom)
@@ -679,6 +726,43 @@ class TinyForgeApp(QMainWindow):
             text.setFont(QFont("Cascadia Mono", 10))
         return text
 
+    def _build_skills_tab(self) -> QWidget:
+        tab = QWidget()
+        tab.setObjectName("SkillsView")
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        summary = QWidget()
+        summary.setObjectName("SkillsSummary")
+        summary_layout = QVBoxLayout(summary)
+        summary_layout.setContentsMargins(12, 10, 12, 9)
+        summary_layout.setSpacing(3)
+        self.skill_status_label = QLabel("Not loaded")
+        self.skill_status_label.setObjectName("SkillStatus")
+        self.skill_status_label.setAccessibleName("Skill runtime status")
+        self.skill_metrics_label = QLabel()
+        self.skill_metrics_label.setObjectName("SkillMetrics")
+        self.skill_metrics_label.setWordWrap(True)
+        self.skill_metrics_label.setAccessibleName("Skill run metrics")
+        summary_layout.addWidget(self.skill_status_label)
+        summary_layout.addWidget(self.skill_metrics_label)
+        layout.addWidget(summary)
+
+        self.skill_tree = QTreeWidget()
+        self.skill_tree.setObjectName("SkillsTree")
+        self.skill_tree.setAccessibleName("Skill catalog and run activity")
+        self.skill_tree.setHeaderLabels(["Stage", "Skill / evidence"])
+        self.skill_tree.setRootIsDecorated(True)
+        self.skill_tree.setAlternatingRowColors(True)
+        self.skill_tree.setUniformRowHeights(True)
+        self.skill_tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.skill_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.skill_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.skill_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.skill_tree, 1)
+        return tab
+
     def _build_inspector(self) -> QWidget:
         panel = QFrame()
         panel.setObjectName("ToolPanel")
@@ -693,11 +777,13 @@ class TinyForgeApp(QMainWindow):
         self.details_text = self._make_inspector_text(code=False, wrap=True)
         self.changes_text = self._make_inspector_text(code=True, wrap=False)
         self.memory_text = self._make_inspector_text(code=True, wrap=True)
+        self.skills_tab = self._build_skills_tab()
         self._diff_highlighter = DiffHighlighter(self.changes_text.document())
         self._memory_highlighter = MemoryHighlighter(self.memory_text.document())
-        self.inspector.addTab(self.details_text, "Details")
-        self.inspector.addTab(self.changes_text, "Changes")
+        self.inspector.addTab(self.details_text, "Info")
+        self.inspector.addTab(self.changes_text, "Diff")
         self.inspector.addTab(self.memory_text, "Memory")
+        self.inspector.addTab(self.skills_tab, "Skills")
         layout.addWidget(self.inspector)
         return panel
 
@@ -858,6 +944,7 @@ class TinyForgeApp(QMainWindow):
         self.model_entry.setText(config.model)
         self.protocol_combo.setCurrentText(config.wire_api)
         self.memory_check.setChecked(config.memory_enabled)
+        self.skills_check.setChecked(config.skills_enabled)
         self._settings_workspace = workspace
         self._settings_dirty = False
 
@@ -875,6 +962,7 @@ class TinyForgeApp(QMainWindow):
             self.workspace_entry.setToolTip(str(workspace))
             self._has_session = False
             self._set_memory_text("Memory has not been loaded for this workspace.")
+            self._reset_skill_activity(clear_catalog=True, state="not_loaded")
             self._reset_terminal(workspace)
         if workspace != self._files_workspace:
             self._reset_files(workspace)
@@ -904,6 +992,7 @@ class TinyForgeApp(QMainWindow):
                 self._apply_workspace_defaults(workspace, preview_config)
             self._has_session = False
             self._set_memory_text("Memory has not been loaded for this workspace.")
+            self._reset_skill_activity(clear_catalog=True, state="not_loaded")
             self._reset_terminal(workspace)
             self._reset_files(workspace)
 
@@ -921,9 +1010,10 @@ class TinyForgeApp(QMainWindow):
         self._current_task_text = ""
         self._change_count = 0
         self._memory_commit_count = 0
+        self._reset_skill_activity(clear_catalog=False, state="ready")
         self.timeline.clear()
         self.timeline_count_label.setText("0 events")
-        self.inspector.setTabText(self.inspector.indexOf(self.changes_text), "Changes")
+        self.inspector.setTabText(self.inspector.indexOf(self.changes_text), "Diff")
         self.inspector.setTabText(self.inspector.indexOf(self.memory_text), "Memory")
         try:
             terminal_workspace = Path(self.workspace_entry.text()).expanduser().resolve()
@@ -933,6 +1023,7 @@ class TinyForgeApp(QMainWindow):
         self._set_details_text("Select an execution step to inspect its evidence.")
         self._set_changes_text("No file changes captured.")
         self._refresh_memory()
+        self._refresh_skills()
         self._request_files_refresh(delay_ms=0)
         self._set_status("Ready", "neutral")
         self._set_stats("New session")
@@ -957,6 +1048,7 @@ class TinyForgeApp(QMainWindow):
                 model=model or None,
                 wire_api=self.protocol_combo.currentText(),
                 memory_enabled=self.memory_check.isChecked(),
+                skills_enabled=self.skills_check.isChecked(),
             )
             self._settings_workspace = workspace
         except (ConfigError, OSError, ValueError) as exc:
@@ -967,7 +1059,7 @@ class TinyForgeApp(QMainWindow):
                 "Info",
                 "Session",
                 "Runtime configuration changed; starting a new context",
-                "The workspace, model, protocol, or memory configuration changed.",
+                "The workspace, model, protocol, memory, or Skill configuration changed.",
                 "muted",
             )
             self._has_session = False
@@ -984,6 +1076,7 @@ class TinyForgeApp(QMainWindow):
             self._set_status("Already running", "warning")
             return
         self.current_run_id = run_id
+        self._begin_skill_run(continue_session=continue_session, enabled=config.skills_enabled)
         if workspace != self._terminal_workspace:
             self._reset_terminal(workspace)
         if workspace != self._files_workspace:
@@ -997,7 +1090,8 @@ class TinyForgeApp(QMainWindow):
         self._set_status("Running", "running")
         self._set_stats(
             f"model={config.model}  ·  protocol={config.wire_api}  ·  "
-            f"memory={'on' if config.memory_enabled else 'off'}"
+            f"memory={'on' if config.memory_enabled else 'off'}  ·  "
+            f"skills={'on' if config.skills_enabled else 'off'}"
         )
         self._set_running(True)
 
@@ -1014,6 +1108,7 @@ class TinyForgeApp(QMainWindow):
             self.protocol_combo,
             self.browse_button,
             self.memory_check,
+            self.skills_check,
             self.new_button,
             self.run_button,
             self.continue_check,
@@ -1089,6 +1184,9 @@ class TinyForgeApp(QMainWindow):
             round_number = int(data.get("round", 0))
             elapsed = int(data.get("elapsed_ms", 0)) / 1000
             tokens = int(data.get("input_tokens", 0)) + int(data.get("output_tokens", 0))
+            self._skill_rounds = max(self._skill_rounds, round_number)
+            self._skill_tokens += max(0, tokens)
+            self._render_skills()
             details = json.dumps(data, ensure_ascii=False, indent=2)
             item = self._round_items.get(round_number)
             if item:
@@ -1192,10 +1290,6 @@ class TinyForgeApp(QMainWindow):
         elif event.kind == "memory_committed":
             count = int(data.get("count", 0))
             self._memory_commit_count += count
-            self.inspector.setTabText(
-                self.inspector.indexOf(self.memory_text),
-                f"Memory ({self._memory_commit_count})",
-            )
             self._insert_timeline(
                 "Saved",
                 "Memory",
@@ -1206,6 +1300,36 @@ class TinyForgeApp(QMainWindow):
         elif event.kind == "memory_error":
             error = str(data.get("error", "Memory update failed"))
             self._insert_timeline("Failed", "Memory", self._one_line(error), error, "error")
+        elif event.kind == "skills_listed":
+            self._record_skill_search(data)
+        elif event.kind == "skill_loaded":
+            skill_id = str(data.get("id", "")).strip()
+            is_new = skill_id not in self._loaded_skill_ids
+            if skill_id:
+                self._record_skill_loaded(data)
+            if skill_id and is_new and skill_id in self._loaded_skill_ids:
+                self._insert_timeline(
+                    "Loaded",
+                    "Skill",
+                    skill_id,
+                    json.dumps(data, ensure_ascii=False, indent=2),
+                    "success",
+                )
+        elif event.kind == "skill_resource_read":
+            self._record_skill_resource(data)
+        elif event.kind == "skill_fault_report":
+            self._record_skill_fault(data)
+        elif event.kind == "skill_adaptation_error":
+            error = redact_secrets(str(data.get("error", "Skill review failed")))
+            error = self.BIDI_CONTROL_RE.sub("", self.CONTROL_CHAR_RE.sub("", error))
+            error = error.strip()[:2_000] or "Skill review failed"
+            self._insert_timeline(
+                "Failed",
+                "Skill review",
+                self._one_line(error),
+                error,
+                "error",
+            )
         elif event.kind == "loop_stopped":
             reason = str(data.get("reason", "Agent loop stopped"))
             self._insert_timeline("Stopped", "Agent", self._one_line(reason), reason, "error")
@@ -1238,6 +1362,7 @@ class TinyForgeApp(QMainWindow):
         self._has_session = True
         self._set_running(False)
         self._refresh_memory()
+        self._refresh_skills()
         self._request_files_refresh(delay_ms=0)
         self._close_after_terminal_event()
 
@@ -1252,6 +1377,7 @@ class TinyForgeApp(QMainWindow):
         self._has_session = True
         self._set_running(False)
         self._refresh_memory()
+        self._refresh_skills()
         self._request_files_refresh(delay_ms=0)
         self._close_after_terminal_event()
 
@@ -1270,6 +1396,493 @@ class TinyForgeApp(QMainWindow):
         except (OSError, TypeError, ValueError) as exc:
             overview = f"Memory could not be loaded: {exc}"
         self._set_memory_text(overview)
+
+    def _reset_skill_activity(self, *, clear_catalog: bool, state: str) -> None:
+        self._skill_searches.clear()
+        self._skill_resource_reads.clear()
+        self._skill_fault_reports.clear()
+        self._skill_search_call_ids.clear()
+        self._skill_resource_call_ids.clear()
+        self._skill_fault_call_ids.clear()
+        self._loaded_skill_ids.clear()
+        self._loaded_skills.clear()
+        self._skill_rounds = 0
+        self._skill_tokens = 0
+        self._skill_state = state
+        if clear_catalog:
+            self._skill_catalog.clear()
+            self._skill_invalid_count = 0
+        if hasattr(self, "skill_tree"):
+            self._render_skills()
+
+    def _begin_skill_run(self, *, continue_session: bool, enabled: bool) -> None:
+        self._skill_searches.clear()
+        self._skill_resource_reads.clear()
+        self._skill_fault_reports.clear()
+        self._skill_search_call_ids.clear()
+        self._skill_resource_call_ids.clear()
+        self._skill_fault_call_ids.clear()
+        self._skill_rounds = 0
+        self._skill_tokens = 0
+        if not continue_session:
+            self._loaded_skill_ids.clear()
+            self._loaded_skills.clear()
+        self._skill_enabled = enabled
+        self._skill_state = "running"
+        self._render_skills()
+
+    @classmethod
+    def _skill_metadata(cls, value: object) -> dict[str, str] | None:
+        if not isinstance(value, dict):
+            return None
+
+        def clean(key: str, limit: int) -> str:
+            text = redact_secrets(str(value.get(key, "")))
+            text = cls.BIDI_CONTROL_RE.sub("", cls.CONTROL_CHAR_RE.sub("", text))
+            return " ".join(text.split())[:limit]
+
+        skill_id = clean("id", 200)
+        if not skill_id:
+            return None
+        scope = clean("scope", 20)
+        if scope not in {"user", "workspace"}:
+            scope = ""
+        name = clean("name", 100) or skill_id.rsplit(":", 1)[-1]
+        return {
+            "id": skill_id,
+            "name": name,
+            "description": clean("description", 500),
+            "scope": scope,
+        }
+
+    @classmethod
+    def _skill_receipt(cls, value: object) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+
+        def clean(key: str, limit: int) -> str:
+            text = redact_secrets(str(value.get(key, "")))
+            text = cls.BIDI_CONTROL_RE.sub("", cls.CONTROL_CHAR_RE.sub("", text))
+            return " ".join(text.split())[:limit]
+
+        skill_id = clean("id", 200)
+        if not skill_id:
+            return None
+
+        def digest(key: str) -> str:
+            candidate = clean(key, 64)
+            return candidate.lower() if re.fullmatch(r"[0-9a-fA-F]{12,64}", candidate) else ""
+
+        loaded_step = value.get("loaded_step", 0)
+        return {
+            "id": skill_id,
+            "sha256": digest("sha256"),
+            "resource_manifest_sha256": digest("resource_manifest_sha256"),
+            "loaded_step": max(0, loaded_step if type(loaded_step) is int else 0),
+        }
+
+    def _apply_skill_snapshot(self, snapshot: object) -> None:
+        if not isinstance(snapshot, dict):
+            self._reset_skill_activity(clear_catalog=True, state="unavailable")
+            return
+        state = str(snapshot.get("state", "unavailable"))
+        if state == "busy":
+            self._skill_state = "running"
+            self._render_skills()
+            return
+        if state != "ready":
+            self._skill_enabled = False
+            self._reset_skill_activity(clear_catalog=True, state=state)
+            return
+
+        available_raw = snapshot.get("available", [])
+        available = []
+        if isinstance(available_raw, list):
+            for value in available_raw[:64]:
+                metadata = self._skill_metadata(value)
+                if metadata is not None:
+                    available.append(metadata)
+        loaded_raw = snapshot.get("loaded", [])
+        loaded = []
+        receipts: dict[str, dict[str, Any]] = {}
+        receipts_raw = snapshot.get("receipts", [])
+        if isinstance(receipts_raw, list):
+            for value in receipts_raw[:64]:
+                receipt = self._skill_receipt(value)
+                if receipt is not None:
+                    receipts[receipt["id"]] = receipt
+        existing_receipts = {
+            item["id"]: {
+                "id": item["id"],
+                "sha256": item.get("sha256", ""),
+                "resource_manifest_sha256": item.get("resource_manifest_sha256", ""),
+                "loaded_step": item.get("loaded_step", 0),
+            }
+            for item in self._loaded_skills
+        }
+        if isinstance(loaded_raw, list):
+            for value in loaded_raw[:64]:
+                metadata = self._skill_metadata(value)
+                if metadata is not None and metadata["id"] not in {item["id"] for item in loaded}:
+                    receipt = receipts.get(metadata["id"]) or existing_receipts.get(metadata["id"])
+                    if receipt is not None:
+                        metadata.update(receipt)
+                    loaded.append(metadata)
+
+        invalid = snapshot.get("invalid_entries_skipped", 0)
+        self._skill_catalog = available
+        self._loaded_skills = loaded
+        self._loaded_skill_ids.clear()
+        self._loaded_skill_ids.update(item["id"] for item in loaded)
+        self._skill_invalid_count = max(0, invalid if type(invalid) is int else 0)
+        self._skill_enabled = snapshot.get("enabled") is True
+        self._skill_state = "ready"
+        self._render_skills()
+
+    def _record_skill_search(self, data: dict[str, Any]) -> None:
+        call_id = str(data.get("call_id", "")).strip()[:200]
+        if call_id and call_id in self._skill_search_call_ids:
+            return
+        candidates = []
+        raw_candidates = data.get("skills", [])
+        if isinstance(raw_candidates, list):
+            for value in raw_candidates[:50]:
+                metadata = self._skill_metadata(value)
+                if metadata is not None:
+                    candidates.append(metadata)
+        query = redact_secrets(str(data.get("query", "")))
+        query = self.BIDI_CONTROL_RE.sub("", self.CONTROL_CHAR_RE.sub("", query))
+        scope = str(data.get("scope", "any"))
+        if scope not in {"any", "user", "workspace"}:
+            scope = "any"
+        query_source = str(data.get("query_source", "explicit"))
+        if query_source not in {"explicit", "task"}:
+            query_source = "explicit"
+        self._skill_searches.append(
+            {
+                "call_id": call_id,
+                "query": " ".join(query.split())[:500],
+                "query_source": query_source,
+                "scope": scope,
+                "skills": candidates,
+            }
+        )
+        if len(self._skill_searches) > self.MAX_SKILL_SEARCHES:
+            self._skill_searches.pop(0)
+        if call_id:
+            self._skill_search_call_ids.add(call_id)
+        invalid = data.get("invalid_entries_skipped", 0)
+        if type(invalid) is int:
+            self._skill_invalid_count = max(self._skill_invalid_count, invalid)
+        self._render_skills()
+
+    def _record_skill_loaded(self, data: dict[str, Any]) -> None:
+        metadata = self._skill_metadata(data)
+        if metadata is None:
+            return
+        receipt = self._skill_receipt(data)
+        if receipt is not None:
+            metadata.update(receipt)
+        if metadata["id"] in self._loaded_skill_ids:
+            for existing in self._loaded_skills:
+                if existing["id"] != metadata["id"]:
+                    continue
+                for key in ("sha256", "resource_manifest_sha256"):
+                    if metadata.get(key):
+                        existing[key] = metadata[key]
+                if metadata.get("loaded_step"):
+                    existing["loaded_step"] = metadata["loaded_step"]
+                self._render_skills()
+                return
+            return
+        self._loaded_skill_ids.add(metadata["id"])
+        self._loaded_skills.append(metadata)
+        self._render_skills()
+
+    def _record_skill_resource(self, data: dict[str, Any]) -> None:
+        call_id = str(data.get("call_id", "")).strip()[:200]
+        if call_id and call_id in self._skill_resource_call_ids:
+            return
+        skill_id = redact_secrets(str(data.get("skill_id", ""))).strip()[:200]
+        path = redact_secrets(str(data.get("path", ""))).strip()[:500]
+        relative = PurePosixPath(path)
+        if (
+            not skill_id
+            or not path
+            or "\\" in path
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or not relative.parts
+            or relative.parts[0] not in {"references", "scripts"}
+        ):
+            return
+        if skill_id not in self._loaded_skill_ids:
+            placeholder = self._skill_metadata({"id": skill_id})
+            if placeholder is not None:
+                self._loaded_skill_ids.add(skill_id)
+                self._loaded_skills.append(placeholder)
+        resource: dict[str, Any] = {
+            "call_id": call_id,
+            "skill_id": skill_id,
+            "path": relative.as_posix(),
+            "truncated": data.get("truncated") is True,
+        }
+        for key in ("start_line", "end_line", "total_lines"):
+            value = data.get(key, 0)
+            resource[key] = min(1_000_000, max(0, value if type(value) is int else 0))
+        self._skill_resource_reads.append(resource)
+        if len(self._skill_resource_reads) > self.MAX_SKILL_RESOURCE_READS:
+            self._skill_resource_reads.pop(0)
+        if call_id:
+            self._skill_resource_call_ids.add(call_id)
+        self._render_skills()
+
+    def _record_skill_fault(self, data: dict[str, Any]) -> None:
+        call_id = str(data.get("call_id", "")).strip()[:200]
+        if call_id and call_id in self._skill_fault_call_ids:
+            return
+
+        def clean(value: object, limit: int) -> str:
+            text = redact_secrets(str(value))
+            text = self.BIDI_CONTROL_RE.sub("", self.CONTROL_CHAR_RE.sub("", text))
+            return " ".join(text.split())[:limit]
+
+        localized_step = data.get("localized_step", 0)
+        report: dict[str, Any] = {
+            "call_id": call_id,
+            "localized_step": max(0, localized_step if type(localized_step) is int else 0),
+            "tool": clean(data.get("tool", "tool"), 100),
+            "observation": clean(data.get("observation", ""), 500),
+            "attribution_status": clean(data.get("attribution_status", "unresolved"), 40),
+            "qualification_status": clean(data.get("qualification_status", "not_run"), 40),
+            "skill_mutation_applied": data.get("skill_mutation_applied") is True,
+            "trace_truncated": data.get("trace_truncated") is True,
+            "active_skill_candidates": [],
+        }
+        candidates = data.get("active_skill_candidates", [])
+        if isinstance(candidates, list):
+            for value in candidates[:64]:
+                if not isinstance(value, dict):
+                    continue
+                skill_id = clean(value.get("id", ""), 200)
+                if not skill_id:
+                    continue
+                loaded_step = value.get("loaded_step", 0)
+                report["active_skill_candidates"].append(
+                    {
+                        "id": skill_id,
+                        "sha256": clean(value.get("sha256", ""), 64),
+                        "loaded_step": max(
+                            0, loaded_step if type(loaded_step) is int else 0
+                        ),
+                    }
+                )
+        self._skill_fault_reports.append(report)
+        if len(self._skill_fault_reports) > self.MAX_SKILL_FAULT_REPORTS:
+            self._skill_fault_reports.pop(0)
+        if call_id:
+            self._skill_fault_call_ids.add(call_id)
+        self._render_skills()
+
+    def _render_skills(self) -> None:
+        if not hasattr(self, "skill_tree"):
+            return
+        candidate_count = sum(
+            len(search.get("skills", [])) for search in self._skill_searches
+        )
+        if self._skill_state == "running":
+            status, tone = (
+                ("Running", "running")
+                if self._skill_enabled
+                else ("Disabled", "warning")
+            )
+        elif self._skill_state == "ready" and self._skill_enabled:
+            status, tone = "Enabled", "success"
+        elif self._skill_state == "ready":
+            status, tone = "Disabled", "warning"
+        elif self._skill_state == "not_loaded":
+            status, tone = "Not loaded", "neutral"
+        else:
+            status, tone = "Unavailable", "warning"
+        self.skill_status_label.setText(status)
+        self.skill_status_label.setProperty("tone", tone)
+        self.skill_status_label.style().unpolish(self.skill_status_label)
+        self.skill_status_label.style().polish(self.skill_status_label)
+
+        metrics = (
+            f"{len(self._skill_catalog)} available  ·  {candidate_count} candidates  ·  "
+            f"{len(self._loaded_skills)} loaded  ·  {len(self._skill_resource_reads)} resources\n"
+            f"{self._skill_rounds} rounds  ·  {self._skill_tokens:,} tokens  ·  "
+            f"{len(self._skill_fault_reports)} fault reports"
+        )
+        if self._skill_invalid_count:
+            metrics += f"  ·  {self._skill_invalid_count} skipped"
+        self.skill_metrics_label.setText(metrics)
+
+        tree = self.skill_tree
+        tree.setUpdatesEnabled(False)
+        tree.clear()
+
+        def group(stage: str, details: str, icon: QStyle.StandardPixmap) -> QTreeWidgetItem:
+            item = QTreeWidgetItem([stage, details])
+            item.setIcon(0, self.style().standardIcon(icon))
+            for column in range(2):
+                font = item.font(column)
+                font.setWeight(QFont.Weight.DemiBold)
+                item.setFont(column, font)
+                item.setForeground(column, QBrush(QColor(self.COLORS["muted"])))
+            tree.addTopLevelItem(item)
+            return item
+
+        catalog_group = group(
+            "Catalog",
+            f"{len(self._skill_catalog)} available",
+            QStyle.StandardPixmap.SP_DirIcon,
+        )
+        for metadata in self._skill_catalog:
+            scope = metadata["scope"] or "unknown"
+            item = QTreeWidgetItem([scope.title(), metadata["id"]])
+            item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon))
+            tooltip = metadata["description"] or metadata["name"]
+            item.setToolTip(1, tooltip)
+            catalog_group.addChild(item)
+
+        search_group = group(
+            "Searches",
+            f"{len(self._skill_searches)} calls · {candidate_count} candidates",
+            QStyle.StandardPixmap.SP_FileDialogContentsView,
+        )
+        for search_index, search in enumerate(self._skill_searches, start=1):
+            query = str(search.get("query", ""))
+            query_source = str(search.get("query_source", "explicit"))
+            scope = str(search.get("scope", "any"))
+            if query:
+                query_label = f'query="{self._one_line(query, 80)}"'
+            elif query_source == "task":
+                query_label = "current task"
+            else:
+                query_label = "all metadata"
+            search_item = QTreeWidgetItem(
+                [f"Search {search_index}", f"{query_label} · scope={scope}"]
+            )
+            search_group.addChild(search_item)
+            for rank, metadata in enumerate(search.get("skills", []), start=1):
+                candidate = QTreeWidgetItem(
+                    [f"#{rank} {metadata['scope'] or 'unknown'}", metadata["id"]]
+                )
+                candidate.setToolTip(1, metadata["description"] or metadata["name"])
+                search_item.addChild(candidate)
+            search_item.setExpanded(True)
+
+        loaded_group = group(
+            "Loaded",
+            f"{len(self._loaded_skills)} in order · {len(self._skill_resource_reads)} reads",
+            QStyle.StandardPixmap.SP_DialogApplyButton,
+        )
+        for load_index, metadata in enumerate(self._loaded_skills, start=1):
+            loaded_item = QTreeWidgetItem([f"#{load_index} Loaded", metadata["id"]])
+            loaded_item.setIcon(
+                0, self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton)
+            )
+            skill_digest = str(metadata.get("sha256", ""))[:12]
+            resource_digest = str(metadata.get("resource_manifest_sha256", ""))[:12]
+            tooltip_lines = [metadata["description"] or metadata["name"]]
+            if skill_digest:
+                tooltip_lines.append(f"sha256 {skill_digest}")
+            if resource_digest:
+                tooltip_lines.append(f"resources {resource_digest}")
+            loaded_item.setToolTip(1, "\n".join(tooltip_lines))
+            loaded_group.addChild(loaded_item)
+            if skill_digest or resource_digest:
+                receipt_parts = []
+                loaded_step = metadata.get("loaded_step", 0)
+                if type(loaded_step) is int and loaded_step > 0:
+                    receipt_parts.append(f"loaded step {loaded_step}")
+                if skill_digest:
+                    receipt_parts.append(f"sha256 {skill_digest}")
+                if resource_digest:
+                    receipt_parts.append(f"resources {resource_digest}")
+                loaded_item.addChild(QTreeWidgetItem(["Receipt", " · ".join(receipt_parts)]))
+            reads = [
+                resource
+                for resource in self._skill_resource_reads
+                if resource["skill_id"] == metadata["id"]
+            ]
+            for resource in reads:
+                start = int(resource["start_line"])
+                end = int(resource["end_line"])
+                total = int(resource["total_lines"])
+                lines = f"lines {start}-{end}/{total}" if total else "empty resource"
+                if resource["truncated"]:
+                    lines += " · truncated"
+                resource_item = QTreeWidgetItem(["Resource", f"{resource['path']} · {lines}"])
+                resource_item.setIcon(
+                    0, self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+                )
+                loaded_item.addChild(resource_item)
+            loaded_item.setExpanded(bool(reads or skill_digest or resource_digest))
+
+        if self._skill_invalid_count:
+            skipped = group(
+                "Skipped",
+                f"{self._skill_invalid_count} invalid catalog entries",
+                QStyle.StandardPixmap.SP_MessageBoxWarning,
+            )
+            skipped.setToolTip(1, "Invalid Skill entries were excluded during discovery")
+
+        if self._skill_fault_reports:
+            fault_group = group(
+                "Adaptation",
+                f"{len(self._skill_fault_reports)} read-only fault reports",
+                QStyle.StandardPixmap.SP_MessageBoxWarning,
+            )
+            for report_index, report in enumerate(self._skill_fault_reports, start=1):
+                step = report["localized_step"]
+                tool = report["tool"] or "tool"
+                suffix = " · trace clipped" if report["trace_truncated"] else ""
+                report_item = QTreeWidgetItem(
+                    [f"Fault {report_index}", f"step {step} · {tool}{suffix}"]
+                )
+                report_item.setToolTip(1, report["observation"])
+                fault_group.addChild(report_item)
+                report_item.addChild(
+                    QTreeWidgetItem(
+                        ["Attribution", report["attribution_status"] or "unresolved"]
+                    )
+                )
+                report_item.addChild(
+                    QTreeWidgetItem(
+                        ["Qualification", report["qualification_status"] or "not_run"]
+                    )
+                )
+                mutation = "applied" if report["skill_mutation_applied"] else "not applied"
+                report_item.addChild(QTreeWidgetItem(["Mutation", mutation]))
+                for candidate_index, candidate in enumerate(
+                    report["active_skill_candidates"], start=1
+                ):
+                    digest = candidate["sha256"][:12]
+                    details = f"{candidate['id']} · loaded step {candidate['loaded_step']}"
+                    if digest:
+                        details += f" · sha256 {digest}"
+                    report_item.addChild(
+                        QTreeWidgetItem([f"Active {candidate_index}", details])
+                    )
+                report_item.setExpanded(True)
+            fault_group.setExpanded(True)
+
+        catalog_group.setExpanded(False)
+        search_group.setExpanded(True)
+        loaded_group.setExpanded(True)
+        tree.setUpdatesEnabled(True)
+        tree.viewport().update()
+
+    def _refresh_skills(self) -> None:
+        try:
+            expected_workspace = Path(self.workspace_entry.text()).expanduser().resolve()
+            snapshot = self.worker.skills_snapshot(expected_workspace=expected_workspace)
+        except (OSError, TypeError, ValueError):
+            snapshot = {"state": "unavailable"}
+        self._apply_skill_snapshot(snapshot)
 
     def _reset_files(self, workspace: Path) -> None:
         try:
@@ -1931,9 +2544,6 @@ class TinyForgeApp(QMainWindow):
             combined = "[Earlier changes omitted]\n\n" + combined[-self.MAX_CHANGES_CHARS :]
         self._set_changes_text(combined)
         self._change_count += 1
-        self.inspector.setTabText(
-            self.inspector.indexOf(self.changes_text), f"Changes ({self._change_count})"
-        )
 
     def _reset_terminal(self, workspace: Path) -> None:
         self.terminal_text.clear()

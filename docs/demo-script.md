@@ -2,7 +2,7 @@
 
 这套流程录制真实的 TinyForge 桌面操作台，不使用伪造事件或预先写好的修复结果。录制脚本
 会准备独立缺陷项目、启动 PySide6 GUI、调用真实模型完成修复，并自动回看测试、Diff、
-文件总览、记忆和最终结果；渲染脚本再加入中文旁白、标题卡和总结卡。
+文件总览、Skill receipt、记忆和最终结果；渲染脚本再加入中文旁白、标题卡和总结卡。
 
 ## 录制前
 
@@ -24,8 +24,8 @@ python -m pip install -e ".[demo]"
    渲染器还使用 Windows 的 Noto Sans SC 和 Cascadia Mono 字体。旁白默认使用联网的
    `zh-CN-XiaoxiaoNeural` 神经语音；断网时 `auto` 模式会整批回退到本地已安装的
    `Microsoft Huihui Desktop`，不会在同一视频中混用音色。
-4. 关闭通知和可能显示个人凭据的窗口，保持显示器布局和系统缩放稳定。脚本会自动选择
-   副屏并放置录制窗口，不要求手动拖动窗口。
+4. 关闭通知和可能显示个人凭据的窗口，保持显示器布局和系统缩放稳定。默认模式会自动选择
+   副屏；`--primary-fullscreen` 会覆盖主屏、置顶并主动获取焦点，两种模式都不要求手动拖动。
 5. 运行主项目测试，预期全部通过：
 
 ```powershell
@@ -52,18 +52,26 @@ python scripts/record_gui_demo.py --output .demo/gui-video-layout-final --force 
 `--output` 必须位于 `.demo` 下；`--force` 会删除并重建指定输出目录。`--timeout` 是 Agent
 运行的最长秒数，超时后脚本会请求协作式停止。
 
+需要覆盖主屏录制时，显式增加 `--primary-fullscreen`。该模式会把窗口绑定到主显示器，进入
+全屏、设置置顶并主动获取焦点：
+
+```powershell
+python scripts/record_gui_demo.py --output .demo/gui-video-primary-fullscreen --primary-fullscreen --timeout 600
+```
+
 脚本会自动完成以下演示流程：
 
 1. 调用 `scripts/prepare_demo.py` 创建全新的 `workspace`，并建立隔离的本地 Git 基线。
 2. 在录制前确认演示项目共有 4 项测试，其中 3 项失败。
-3. 优先选择第一个非主显示器；没有副屏时才回退主屏。在目标屏幕可用区域中央打开标题为
-   `TinyForge 0.3.0 - Live GUI Demo`、约 `1020x720` 的普通独立 PySide6 窗口。脚本不调用
-   `raise_()` 或 `activateWindow()`，不会主动抢占用户的键盘焦点，也不要求手动拖动窗口。
-4. 自动输入任务，要求 Agent 先建立失败基线，只修改 `pricing.py`，再次运行完整测试，并
-   使用 `stage_memory` 保存带验证证据的 SOP。
+3. 默认优先选择第一个非主显示器并打开约 `1020x720` 的普通窗口；显式使用
+   `--primary-fullscreen` 时绑定主屏、调用 `showFullScreen()`、设置 `WindowStaysOnTopHint`，
+   并验证全屏、置顶和目标显示器状态。
+4. 把仓库中的 `verified-bugfix` 示例复制到隔离工作区并通过进程配置启用 Skills。自动输入
+   的任务要求 Agent 先检索、加载 Skill，再建立失败基线，只修改 `pricing.py`，重新执行完整
+   测试，并使用 `stage_memory` 保存带验证证据的 SOP。
 5. 在中间区域同步展示执行时间线，以及下方独立的命令、输出和退出状态。
 6. Agent 结束后依次回看最终 Result、失败测试、统一 Diff、左侧 Workspace 中的 Git 修改
-   状态和 `pricing.py` 只读预览、成功测试及持久记忆。
+   状态和 `pricing.py` 只读预览、成功测试、持久记忆及 Skill 检索和 receipt。
 7. 在 GUI 关闭后独立复跑 4 项测试，并检查只改动了 `pricing.py`。
 
 录制成功时，终端最后输出的 JSON 必须包含：
@@ -77,7 +85,7 @@ python scripts/record_gui_demo.py --output .demo/gui-video-layout-final --force 
 系统缩放和窗口边框都会计入抓取区域，`result.json` 也会记录 `capture_screen` 和
 `capture_region` 便于复核。
 
-主要录制产物位于 `.demo/gui-video-layout-final/`：
+主要录制产物位于命令指定的 `.demo/<recording-name>/`：
 
 - `gui-raw.mp4`：无旁白的真实 GUI 窗口录制；
 - `capture-reference.png`：Qt 在录制开始前保存的窗口参考图；
@@ -94,10 +102,11 @@ python scripts/record_gui_demo.py --output .demo/gui-video-layout-final --force 
 
 成片按以下顺序呈现，具体时间由录制标记自动计算：
 
-- 8 秒标题卡：说明“真实模型调用、原生桌面 GUI、完整工具时间线”；
+- 8 秒标题卡：说明“真实模型调用、原生桌面 GUI、Skill、文件与工具证据”；
 - GUI 主体：输入带约束的任务，观察 Agent 建立基线、读取代码、修改实现和执行验证；
 - 证据回看：展示命令面板中的 3 项初始失败、仅含 `pricing.py` 的 Diff、Workspace 文件树
-  与 Git 状态、带行号的代码预览以及命令面板中的 4 项测试全过；
+  与 Git 状态、带行号的代码预览、命令面板中的 4 项测试全过，以及 Skills 页中的检索记录、
+  加载顺序与内容哈希；
 - 9 秒记忆卡：展示 SOP 内容及其修改、测试证据；
 - 11 秒总结卡：展示完成状态、工具统计和主项目完整测试通过。
 
@@ -111,8 +120,8 @@ python scripts/record_gui_demo.py --output .demo/gui-video-layout-final --force 
 
 ```powershell
 python scripts/render_gui_demo_video.py `
-  --input .demo/gui-video-layout-final `
-  --output .demo/gui-video-layout-final/TinyForge-GUI-Layout-demo-2min.mp4 `
+  --input .demo/gui-video-primary-fullscreen `
+  --output .demo/gui-video-primary-fullscreen/TinyForge-GUI-Primary-Fullscreen-demo-2min.mp4 `
   --max-gui-seconds 92 `
   --tts-backend edge `
   --edge-voice zh-CN-XiaoxiaoNeural `

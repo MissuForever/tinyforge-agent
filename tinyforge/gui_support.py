@@ -596,3 +596,46 @@ class AgentWorker:
             ):
                 return "Memory has not been loaded for this workspace."
             return _redact_and_clip(self._agent.memory_overview())
+
+    def skills_overview(self, *, expected_workspace: Path | None = None) -> str:
+        with self._lock:
+            if self._active_run_id is not None:
+                return "Skill refresh is available after the current task finishes."
+            if self._agent is None:
+                return "Skills have not been loaded for this workspace."
+            if expected_workspace is not None and (
+                self._config is None
+                or self._config.workspace != expected_workspace.expanduser().resolve()
+            ):
+                return "Skills have not been loaded for this workspace."
+            overview = getattr(self._agent, "skills_overview", None)
+            if not callable(overview):
+                return "Skills are unavailable for this runtime."
+            return _redact_and_clip(str(overview()))
+
+    def skills_snapshot(self, *, expected_workspace: Path | None = None) -> dict[str, Any]:
+        """Return a bounded metadata-only Skill snapshot for the desktop run view."""
+        empty = {
+            "state": "not_loaded",
+            "enabled": False,
+            "available": [],
+            "loaded": [],
+            "invalid_entries_skipped": 0,
+        }
+        with self._lock:
+            if self._active_run_id is not None:
+                return {**empty, "state": "busy"}
+            if self._agent is None:
+                return empty
+            if expected_workspace is not None and (
+                self._config is None
+                or self._config.workspace != expected_workspace.expanduser().resolve()
+            ):
+                return empty
+            snapshot = getattr(self._agent, "skills_snapshot", None)
+            if not callable(snapshot):
+                return {**empty, "state": "unavailable"}
+            safe_snapshot = _safe_ui_value(snapshot())
+            if not isinstance(safe_snapshot, dict):
+                return {**empty, "state": "unavailable"}
+            return safe_snapshot

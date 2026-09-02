@@ -37,7 +37,8 @@ WINDOW_WIDTH = 1_020
 WINDOW_HEIGHT = 720
 TEST_COMMAND = "python -m unittest discover -s tests -t . -v"
 TASK = (
-    "阅读 README.md、pricing.py 和完整测试。先使用 run_command 运行 "
+    "先使用 list_skills 检索 verified bugfix 并加载匹配的 Skill。"
+    "然后阅读 README.md、pricing.py 和完整测试。先使用 run_command 运行 "
     f"{TEST_COMMAND}，记录当前失败；"
     "只修改 pricing.py 修复 order_total，不得修改测试；再次运行同一条完整测试命令验证。"
     "测试通过后，使用 stage_memory 保存带验证证据的可复用 SOP。"
@@ -131,21 +132,41 @@ def _safe_endpoint(value: str) -> str:
     return f"{parsed.scheme}://{host}{path}"
 
 
-def _position_recording_window(application: QApplication, app: Any) -> Any:
-    """Place a compact recording window on a non-primary display when available."""
+def _position_recording_window(
+    application: QApplication,
+    app: Any,
+    *,
+    primary_fullscreen: bool = False,
+) -> Any:
+    """Place the recording window in the requested, explicitly verified mode."""
     primary = application.primaryScreen()
     if primary is None:
         raise RuntimeError("Qt did not report a primary screen")
-    target = next((screen for screen in application.screens() if screen is not primary), primary)
-    area = target.availableGeometry()
+    target = (
+        primary
+        if primary_fullscreen
+        else next(
+            (screen for screen in application.screens() if screen is not primary),
+            primary,
+        )
+    )
+    area = target.geometry() if primary_fullscreen else target.availableGeometry()
     width = min(WINDOW_WIDTH, max(960, area.width() - 24))
     height = min(WINDOW_HEIGHT, max(600, area.height() - 48))
 
     app.setMinimumSize(960, 600)
-    app.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-    app.setWindowFlag(Qt.WindowType.WindowDoesNotAcceptFocus, True)
-    if target is not primary:
-        app.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+    app.setAttribute(
+        Qt.WidgetAttribute.WA_ShowWithoutActivating,
+        not primary_fullscreen,
+    )
+    app.setWindowFlag(
+        Qt.WindowType.WindowDoesNotAcceptFocus,
+        not primary_fullscreen,
+    )
+    app.setWindowFlag(
+        Qt.WindowType.WindowStaysOnTopHint,
+        primary_fullscreen or target is not primary,
+    )
 
     # Bind the native window to the target display before its first show so it
     # never flashes on the primary display during a mixed-DPI screen transfer.
@@ -154,13 +175,25 @@ def _position_recording_window(application: QApplication, app: Any) -> Any:
     if handle is None:
         raise RuntimeError("Qt did not create a native recording window")
     handle.setScreen(target)
-    app.resize(width, height)
-    app.move(
-        area.x() + max(0, (area.width() - width) // 2),
-        area.y() + max(0, (area.height() - height) // 2),
-    )
-    app.show()
+    if primary_fullscreen:
+        app.setGeometry(area)
+        app.showFullScreen()
+    else:
+        app.resize(width, height)
+        app.move(
+            area.x() + max(0, (area.width() - width) // 2),
+            area.y() + max(0, (area.height() - height) // 2),
+        )
+        app.show()
     application.processEvents()
+    if primary_fullscreen:
+        app.raise_()
+        app.activateWindow()
+        application.processEvents()
+        if not app.isFullScreen():
+            raise RuntimeError("The primary recording window did not enter full-screen mode")
+        if not app.windowFlags() & Qt.WindowType.WindowStaysOnTopHint:
+            raise RuntimeError("The primary recording window is not configured as topmost")
     if app.windowHandle().screen() is not target:
         raise RuntimeError(f"Unable to place the recording window on {target.name()}")
     return target
@@ -398,6 +431,7 @@ class DemoController:
             ("workspace_files", self._show_files, 6_500),
             ("verification_evidence", self._show_passed_test, 5_500),
             ("persistent_memory", self._show_memory, 6_500),
+            ("skill_receipt", self._show_skills, 6_500),
             ("final_result", self._show_result, 5_000),
         ]
 
@@ -548,6 +582,23 @@ class DemoController:
         scrollbar = self.app.memory_text.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
+    def _show_skills(self) -> None:
+        for index in range(self.app.inspector.count()):
+            if self.app.inspector.tabText(index) == "Skills":
+                self.app.inspector.setCurrentIndex(index)
+                break
+        for index in range(self.app.skill_tree.topLevelItemCount()):
+            item = self.app.skill_tree.topLevelItem(index)
+            if item.text(0) != "Loaded":
+                continue
+            item.setExpanded(True)
+            self.app.skill_tree.setCurrentItem(item)
+            self.app.skill_tree.scrollToItem(
+                item,
+                QAbstractItemView.ScrollHint.PositionAtCenter,
+            )
+            break
+
     def _show_result(self) -> None:
         self._select_timeline(state=None, action="Result", last=True)
 
@@ -579,6 +630,11 @@ def main() -> int:
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT.relative_to(ROOT)))
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument(
+        "--primary-fullscreen",
+        action="store_true",
+        help="Record a topmost full-screen window on the primary display",
+    )
     args = parser.parse_args()
 
     output = _inside_demo(ROOT / args.output)
@@ -603,9 +659,24 @@ def main() -> int:
         print(prepare.stdout, file=sys.stderr)
         return prepare.returncode
 
+    skill_source = ROOT / ".tinyforge" / "skills" / "verified-bugfix"
+    skill_target = workspace / ".tinyforge" / "skills" / "verified-bugfix"
+    if not (skill_source / "SKILL.md").is_file():
+        print(f"Demo Skill not found: {skill_source}", file=sys.stderr)
+        return 2
+    skill_target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(skill_source, skill_target)
+
     git_commands = [
         ["git", "init", "--quiet"],
-        ["git", "add", "README.md", "pricing.py", "tests"],
+        [
+            "git",
+            "add",
+            "README.md",
+            "pricing.py",
+            "tests",
+            ".tinyforge/skills/verified-bugfix",
+        ],
         [
             "git",
             "-c",
@@ -659,6 +730,7 @@ def main() -> int:
         {
             "TINYFORGE_STATE_DIR": str(output / "state"),
             "TINYFORGE_ARCHIVE_SESSIONS": "0",
+            "TINYFORGE_SKILLS_ENABLED": "1",
             "TINYFORGE_MAX_ROUNDS": "20",
             "PYTHONIOENCODING": "utf-8",
             "PYTHONUTF8": "1",
@@ -677,7 +749,11 @@ def main() -> int:
     application.setFont(QFont("Segoe UI", 10))
     app = TinyForgeApp(workspace)
     app.setWindowTitle(WINDOW_TITLE)
-    target_screen = _position_recording_window(application, app)
+    target_screen = _position_recording_window(
+        application,
+        app,
+        primary_fullscreen=args.primary_fullscreen,
+    )
 
     controller = DemoController(application, app, output=output, timeout=args.timeout)
     QTimer.singleShot(900, controller.start_capture)
@@ -720,6 +796,18 @@ def main() -> int:
         "selected": app._selected_file_path == "pricing.py",
         "preview_ready": "order_total" in app.file_preview_text.toPlainText(),
         "git_status": pricing_entry.git_status if pricing_entry is not None else "",
+    }
+    loaded_skills = [dict(item) for item in app._loaded_skills]
+    skill_showcase = {
+        "enabled": app._skill_enabled,
+        "search_count": len(app._skill_searches),
+        "loaded": [str(item.get("id", "")) for item in loaded_skills],
+        "receipts_complete": bool(loaded_skills)
+        and all(
+            len(str(item.get("sha256", ""))) == 64
+            and len(str(item.get("resource_manifest_sha256", ""))) == 64
+            for item in loaded_skills
+        ),
     }
     app._destroy_window()
     application.processEvents()
@@ -764,6 +852,9 @@ def main() -> int:
     files_marker_recorded = any(
         marker.get("name") == "workspace_files" for marker in controller.markers
     )
+    skill_marker_recorded = any(
+        marker.get("name") == "skill_receipt" for marker in controller.markers
+    )
 
     result_data = {
         "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -776,6 +867,7 @@ def main() -> int:
             "reasoning_effort": config.reasoning_effort,
             "store_responses": config.store_responses,
             "memory_enabled": config.memory_enabled,
+            "skills_enabled": config.skills_enabled,
         },
         "status": status,
         "stats": stats,
@@ -795,6 +887,8 @@ def main() -> int:
         "command_showcase": command_showcase,
         "files_showcase": files_showcase,
         "files_marker_recorded": files_marker_recorded,
+        "skill_showcase": skill_showcase,
+        "skill_marker_recorded": skill_marker_recorded,
         "changed_files": changed_files,
         "change_count": change_count,
         "memory_commit_count": memory_commit_count,
@@ -802,6 +896,11 @@ def main() -> int:
         "ffmpeg_exit_code": ffmpeg_code,
         "capture_region": controller.capture_region,
         "capture_screen": target_screen.name(),
+        "capture_mode": (
+            "primary_fullscreen_topmost"
+            if args.primary_fullscreen
+            else "secondary_compact"
+        ),
         "recording_duration": controller.elapsed(),
         "markers": controller.markers,
         "events": controller.events,
@@ -831,6 +930,11 @@ def main() -> int:
         and files_showcase["preview_ready"]
         and "M" in files_showcase["git_status"]
         and files_marker_recorded
+        and skill_showcase["enabled"]
+        and skill_showcase["search_count"] >= 1
+        and "workspace:verified-bugfix" in skill_showcase["loaded"]
+        and skill_showcase["receipts_complete"]
+        and skill_marker_recorded
         and changed_files == ["pricing.py"]
         and change_count >= 1
         and memory_commit_count >= 1
@@ -845,6 +949,7 @@ def main() -> int:
                 "changed_files": changed_files,
                 "command_showcase": command_showcase,
                 "files_showcase": files_showcase,
+                "skill_showcase": skill_showcase,
                 "memory_commits": memory_commit_count,
                 "raw_video": str(output / "gui-raw.mp4"),
                 "result": str(output / "result.json"),
