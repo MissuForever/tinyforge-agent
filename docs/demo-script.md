@@ -85,6 +85,9 @@ python scripts/record_gui_demo.py --output .demo/gui-video-primary-fullscreen --
 系统缩放和窗口边框都会计入抓取区域，`result.json` 也会记录 `capture_screen` 和
 `capture_region` 便于复核。
 
+录制结束时脚本会保持 TinyForge 窗口可见，先向 FFmpeg 发送停止信号并等待 MP4 封口，再
+退出 GUI。不要把这两个步骤调换，否则桌面矩形捕获会在尾部录入短暂出现的后台窗口。
+
 主要录制产物位于命令指定的 `.demo/<recording-name>/`：
 
 - `gui-raw.mp4`：无旁白的真实 GUI 窗口录制；

@@ -250,6 +250,9 @@ class DemoController:
         self.timeout = timeout
         self.ffmpeg: subprocess.Popen[str] | None = None
         self.ffmpeg_log: Any = None
+        self.ffmpeg_code: int | None = None
+        self.capture_stopped = False
+        self.finishing = False
         self.record_started = 0.0
         self.run_started = 0.0
         self.result: Any = None
@@ -603,10 +606,19 @@ class DemoController:
         self._select_timeline(state=None, action="Result", last=True)
 
     def finish(self) -> None:
+        if self.finishing:
+            return
+        self.finishing = True
         self.mark("recording_finished")
+        # Stop desktop capture while TinyForge is still visible. Closing the Qt
+        # window first exposes the underlying desktop for several frames.
+        self.stop_capture()
         self.application.quit()
 
     def stop_capture(self) -> int | None:
+        if self.capture_stopped:
+            return self.ffmpeg_code
+        self.capture_stopped = True
         if self.ffmpeg is None:
             return None
         if self.ffmpeg.poll() is None and self.ffmpeg.stdin is not None:
@@ -622,7 +634,9 @@ class DemoController:
             code = self.ffmpeg.wait(timeout=10)
         if self.ffmpeg_log is not None:
             self.ffmpeg_log.close()
-        return code
+            self.ffmpeg_log = None
+        self.ffmpeg_code = code
+        return self.ffmpeg_code
 
 
 def main() -> int:
