@@ -207,7 +207,10 @@ def create_agent(args: argparse.Namespace, console: Console) -> Agent:
 
 
 def interactive(agent: Agent, console: Console) -> int:
-    print("Enter a programming task. Commands: /new, /memory, /skills, /help, /exit")
+    print(
+        "Enter a programming task. Commands: /new, /history, /open, /rename, "
+        "/delete, /memory, /skills, /help, /exit"
+    )
     continuing = False
     while True:
         try:
@@ -227,8 +230,49 @@ def interactive(agent: Agent, console: Console) -> int:
         if task == "/help":
             print(
                 "/new clears conversation context; /memory shows the working and persistent "
-                "memory index; /skills shows the local Skill catalog; /exit closes TinyForge."
+                "memory index; /history lists archived conversations; /open ID restores one; "
+                "/rename ID TITLE and /delete ID manage it; /skills shows the local Skill "
+                "catalog; /exit closes TinyForge."
             )
+            continue
+        if task == "/history":
+            sessions = agent.list_sessions()
+            if not sessions:
+                print("No archived conversations.")
+            for item in sessions:
+                resumable = "" if item["resumable"] else " [view only]"
+                print(f"{item['id']}  {item['updated_at']}  {item['title']}{resumable}")
+            continue
+        if task.startswith("/open "):
+            try:
+                record = agent.restore_session(task[6:].strip())
+            except (OSError, TypeError, ValueError) as exc:
+                print(console.paint(f"Could not restore session: {exc}", "red"))
+                continue
+            continuing = True
+            print(f"Restored session: {record['title']}")
+            continue
+        if task.startswith("/rename "):
+            parts = task.split(maxsplit=2)
+            if len(parts) < 3:
+                print("Usage: /rename ID TITLE")
+                continue
+            try:
+                renamed = agent.rename_session(parts[1], parts[2])
+            except (OSError, TypeError, ValueError) as exc:
+                print(console.paint(f"Could not rename session: {exc}", "red"))
+                continue
+            print(f"Renamed session: {renamed['title']}")
+            continue
+        if task.startswith("/delete "):
+            try:
+                deleted = agent.delete_session(task[8:].strip())
+            except (OSError, TypeError, ValueError) as exc:
+                print(console.paint(f"Could not delete session: {exc}", "red"))
+                continue
+            if deleted:
+                continuing = False
+            print("Deleted session." if deleted else "Session was not found.")
             continue
         if task == "/memory":
             print(agent.memory_overview())

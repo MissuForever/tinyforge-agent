@@ -35,6 +35,7 @@ if QApplication is not None:
     from tinyforge.config import Config
     from tinyforge.gui import TinyForgeApp
     from tinyforge.gui_support import AgentWorker
+    from tinyforge.memory import MemoryStore
     from tinyforge.workspace_view import WorkspaceFile, WorkspaceFilePreview, WorkspaceIndex
 else:
     AgentEvent = None
@@ -42,6 +43,7 @@ else:
     Config = None
     AgentWorker = None
     TinyForgeApp = None
+    MemoryStore = None
     WorkspaceFile = None
     WorkspaceFilePreview = None
     WorkspaceIndex = None
@@ -393,6 +395,51 @@ class GuiWidgetTests(unittest.TestCase):
         )
         self.assertEqual(self.app.file_tree.columnCount(), 2)
         self.assertEqual(self.app.file_tree.headerItem().text(1), "GIT")
+        self.assertEqual(
+            [self.app.workspace_tabs.tabText(index) for index in range(2)],
+            ["Files", "History"],
+        )
+
+    def test_history_sidebar_restores_renames_and_deletes_session(self) -> None:
+        assert MemoryStore is not None
+        assert QMessageBox is not None
+        workspace = Path(self.temp.name).resolve()
+        config = Config.from_env(workspace)
+        store = MemoryStore(config.state_dir, workspace)
+        store.archive(
+            "Repair parser",
+            "Parser repaired",
+            True,
+            [
+                {"role": "system", "content": "old prompt"},
+                {"role": "user", "content": "Repair parser"},
+                {"role": "assistant", "content": "Parser repaired"},
+            ],
+            session_id="gui-history",
+            title="Parser repair",
+        )
+
+        self.app._refresh_history()
+        self.assertEqual(self.app.history_tree.topLevelItemCount(), 1)
+        item = self.app.history_tree.topLevelItem(0)
+        self.app.history_tree.setCurrentItem(item)
+        self.app._open_session()
+        self.assertTrue(self.app._has_session)
+        self.assertEqual(self.app._current_session_id, "gui-history")
+        self.assertIn("Parser repaired", self.app._entry_details.values())
+
+        with patch("tinyforge.gui.QInputDialog.getText", return_value=("Renamed chat", True)):
+            self.app._rename_session()
+        self.assertEqual(self.app.history_tree.topLevelItem(0).text(0), "Renamed chat")
+
+        self.app.history_tree.setCurrentItem(self.app.history_tree.topLevelItem(0))
+        with patch(
+            "tinyforge.gui.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.app._delete_session()
+        self.assertEqual(self.app.history_tree.topLevelItemCount(), 0)
+        self.assertFalse(self.app._has_session)
 
     def test_files_tree_filters_previews_and_preserves_selection_on_refresh(self) -> None:
         workspace = Path(self.temp.name)

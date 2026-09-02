@@ -63,6 +63,7 @@ _LOCAL_LOCKS: dict[str, threading.Lock] = {}
 _LOCAL_LOCKS_GUARD = threading.Lock()
 ARCHIVE_MAX_BYTES = 60_000
 ARCHIVE_MAX_MESSAGES = 200
+SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 
 
 def _now() -> str:
@@ -608,6 +609,98 @@ class MemoryStore:
         )
         temporary.replace(path)
 
+    def _session_path(self, session_id: str) -> Path:
+        clean_id = str(session_id).strip()
+        if not SESSION_ID_PATTERN.fullmatch(clean_id):
+            raise ValueError("Invalid session ID")
+        return self.root / "sessions" / f"{clean_id}.json"
+
+    def list_sessions(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Return bounded metadata for this workspace's archived conversations."""
+        sessions_dir = self.root / "sessions"
+        if not sessions_dir.is_dir():
+            return []
+        records: list[dict[str, Any]] = []
+        for path in sessions_dir.glob("*.json"):
+            if path.stat().st_size > ARCHIVE_MAX_BYTES + 4096:
+                continue
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeError):
+                continue
+            if not isinstance(record, dict):
+                continue
+            stored_workspace = str(record.get("workspace", ""))
+            if stored_workspace and os.path.normcase(stored_workspace) != self._workspace_key:
+                continue
+            messages = record.get("messages")
+            if not isinstance(messages, list):
+                continue
+            title = _clip(
+                redact_secrets(str(record.get("title") or record.get("task") or "Untitled session")),
+                160,
+            )
+            records.append(
+                {
+                    "id": path.stem,
+                    "title": title,
+                    "created_at": str(record.get("created_at", "")),
+                    "updated_at": str(
+                        record.get("updated_at") or record.get("created_at") or ""
+                    ),
+                    "success": bool(record.get("success")),
+                    "message_count": len(messages),
+                    "resumable": not bool(record.get("messages_truncated")),
+                }
+            )
+        records.sort(key=lambda item: (item["updated_at"], item["id"]), reverse=True)
+        return records[: max(1, min(int(limit), 500))]
+
+    def load_session(self, session_id: str) -> dict[str, Any]:
+        path = self._session_path(session_id)
+        if not path.is_file() or path.stat().st_size > ARCHIVE_MAX_BYTES + 4096:
+            raise ValueError("Session was not found or is too large")
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeError) as exc:
+            raise ValueError("Session archive is unreadable") from exc
+        if not isinstance(record, dict) or not isinstance(record.get("messages"), list):
+            raise ValueError("Session archive is invalid")
+        stored_workspace = str(record.get("workspace", ""))
+        if stored_workspace and os.path.normcase(stored_workspace) != self._workspace_key:
+            raise ValueError("Session belongs to a different workspace")
+        record["id"] = path.stem
+        record["title"] = _clip(
+            redact_secrets(str(record.get("title") or record.get("task") or "Untitled session")),
+            160,
+        )
+        return record
+
+    def rename_session(self, session_id: str, title: str) -> dict[str, Any]:
+        clean_title = _clip(redact_secrets(str(title).strip()), 160)
+        if not clean_title:
+            raise ValueError("Session title cannot be empty")
+        path = self._session_path(session_id)
+        with _file_lock(self.root / ".sessions.lock"):
+            record = self.load_session(session_id)
+            record["title"] = clean_title
+            record["updated_at"] = _now()
+            self._atomic_write(path, record)
+        return {
+            "id": session_id,
+            "title": clean_title,
+            "updated_at": str(record["updated_at"]),
+        }
+
+    def delete_session(self, session_id: str) -> bool:
+        path = self._session_path(session_id)
+        with _file_lock(self.root / ".sessions.lock"):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                return False
+        return True
+
     def commit(self, candidate: MemoryCandidate) -> dict[str, Any]:
         with _file_lock(self.lock_path):
             return self._commit_unlocked(candidate)
@@ -754,9 +847,27 @@ class MemoryStore:
             self._atomic_write(self.index_path, index)
         return results
 
-    def archive(self, task: str, answer: str, success: bool, messages: list[dict[str, Any]]) -> None:
+    def archive(
+        self,
+        task: str,
+        answer: str,
+        success: bool,
+        messages: list[dict[str, Any]],
+        *,
+        session_id: str | None = None,
+        title: str | None = None,
+    ) -> str | None:
         if not self.archive_sessions:
-            return
+            return None
+        archive_id = session_id or uuid.uuid4().hex
+        path = self._session_path(archive_id)
+        created_at = _now()
+        if path.is_file():
+            try:
+                existing = self.load_session(archive_id)
+                created_at = str(existing.get("created_at") or created_at)
+            except ValueError:
+                pass
         safe_messages = []
         safe_task = _clip(redact_secrets(task), 4000)
         safe_answer = _clip(redact_secrets(answer), 8000)
@@ -777,7 +888,10 @@ class MemoryStore:
                     copied["tool_calls"] = calls
             safe_messages.append(copied)
         record = {
-            "created_at": _now(),
+            "id": archive_id,
+            "title": _clip(redact_secrets(str(title or task).strip()), 160),
+            "created_at": created_at,
+            "updated_at": _now(),
             "workspace": redact_secrets(str(self.workspace)),
             "task": safe_task,
             "success": success,
@@ -797,8 +911,9 @@ class MemoryStore:
             record["task"] = record["task"][: len(record["task"]) // 2]
         if serialized_size() > ARCHIVE_MAX_BYTES:
             record["workspace"] = _clip(str(record["workspace"]), 256)
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-        self._atomic_write(self.root / "sessions" / f"{stamp}-{uuid.uuid4().hex[:6]}.json", record)
+        with _file_lock(self.root / ".sessions.lock"):
+            self._atomic_write(path, record)
+        return archive_id
 
 
 class MemoryRuntime:
@@ -993,9 +1108,18 @@ class MemoryRuntime:
         task: str,
         answer: str,
         messages: list[dict[str, Any]],
+        session_id: str | None = None,
+        title: str | None = None,
     ) -> list[dict[str, Any]]:
         committed = []
-        self.store.archive(task, answer, success, messages)
+        self.store.archive(
+            task,
+            answer,
+            success,
+            messages,
+            session_id=session_id,
+            title=title,
+        )
         if success:
             for candidate in self.working.staged:
                 try:

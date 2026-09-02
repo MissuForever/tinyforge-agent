@@ -7,6 +7,7 @@ import json
 import platform
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -49,7 +50,30 @@ class MemoryProvider(Protocol):
         task: str,
         answer: str,
         messages: list[dict[str, Any]],
+        session_id: str | None = None,
+        title: str | None = None,
     ) -> list[dict[str, Any]]: ...
+
+
+class SessionStore(Protocol):
+    def list_sessions(self, *, limit: int = 100) -> list[dict[str, Any]]: ...
+
+    def load_session(self, session_id: str) -> dict[str, Any]: ...
+
+    def rename_session(self, session_id: str, title: str) -> dict[str, Any]: ...
+
+    def delete_session(self, session_id: str) -> bool: ...
+
+    def archive(
+        self,
+        task: str,
+        answer: str,
+        success: bool,
+        messages: list[dict[str, Any]],
+        *,
+        session_id: str | None = None,
+        title: str | None = None,
+    ) -> str | None: ...
 
 
 class SkillProvider(Protocol):
@@ -159,6 +183,7 @@ class Agent:
         max_context_tokens: int | None = None,
         on_event: EventHandler | None = None,
         memory: MemoryProvider | None = None,
+        session_store: SessionStore | None = None,
         skills: SkillProvider | None = None,
         skills_enabled: bool = False,
     ) -> None:
@@ -170,9 +195,12 @@ class Agent:
         self.max_context_tokens = max_context_tokens
         self.on_event = on_event or (lambda event: None)
         self.memory = memory
+        self.session_store = session_store
         self.skills = skills
         self.messages: list[dict[str, Any]] = []
         self._current_task = ""
+        self._session_id = ""
+        self._session_title = ""
         self._base_system_prompt = build_system_prompt(
             self.workspace,
             memory_enabled=self.memory is not None,
@@ -182,10 +210,79 @@ class Agent:
     def reset(self) -> None:
         self.messages = []
         self._current_task = ""
+        self._session_id = ""
+        self._session_title = ""
         if self.memory is not None:
             self.memory.reset()
         if self.skills is not None:
             self.skills.reset()
+
+    def list_sessions(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        if self.session_store is None:
+            return []
+        return self.session_store.list_sessions(limit=limit)
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id or None
+
+    def restore_session(self, session_id: str) -> dict[str, Any]:
+        if self.session_store is None:
+            raise ValueError("Conversation history is unavailable")
+        record = self.session_store.load_session(session_id)
+        if record.get("messages_truncated"):
+            raise ValueError("This archived session was truncated and cannot be resumed safely")
+        raw_messages = record.get("messages")
+        if not isinstance(raw_messages, list):
+            raise ValueError("Session archive has no valid messages")
+        restored: list[dict[str, Any]] = [
+            {"role": "system", "content": self._base_system_prompt}
+        ]
+        has_user = False
+        for raw in raw_messages:
+            if not isinstance(raw, dict):
+                raise ValueError("Session archive contains an invalid message")
+            role = str(raw.get("role", ""))
+            if role == "system":
+                continue
+            if role not in {"user", "assistant", "tool"}:
+                raise ValueError("Session archive contains an unsupported message role")
+            message: dict[str, Any] = {
+                "role": role,
+                "content": str(raw.get("content") or ""),
+            }
+            if role == "user":
+                has_user = True
+            if raw.get("tool_call_id"):
+                message["tool_call_id"] = str(raw["tool_call_id"])
+            if raw.get("tool_calls") is not None:
+                if not isinstance(raw["tool_calls"], list):
+                    raise ValueError("Session archive contains invalid tool calls")
+                message["tool_calls"] = raw["tool_calls"]
+            restored.append(message)
+        if not has_user:
+            raise ValueError("Session archive has no user message")
+        self.reset()
+        self.messages = restored
+        self._session_id = str(record["id"])
+        self._session_title = str(record.get("title") or record.get("task") or "Session")
+        return record
+
+    def rename_session(self, session_id: str, title: str) -> dict[str, Any]:
+        if self.session_store is None:
+            raise ValueError("Conversation history is unavailable")
+        renamed = self.session_store.rename_session(session_id, title)
+        if self._session_id == session_id:
+            self._session_title = str(renamed["title"])
+        return renamed
+
+    def delete_session(self, session_id: str) -> bool:
+        if self.session_store is None:
+            raise ValueError("Conversation history is unavailable")
+        deleted = self.session_store.delete_session(session_id)
+        if deleted and self._session_id == session_id:
+            self.reset()
+        return deleted
 
     def memory_overview(self) -> str:
         if self.memory is None:
@@ -227,6 +324,8 @@ class Agent:
         if self.memory is not None:
             self.memory.start_task(self._current_task)
         if not continue_session or not self.messages:
+            self._session_id = uuid.uuid4().hex
+            self._session_title = self._current_task
             self.messages = [
                 {"role": "system", "content": self._base_system_prompt},
             ]
@@ -473,9 +572,23 @@ class Agent:
                     task=self._current_task,
                     answer=result.answer,
                     messages=self.messages,
+                    session_id=self._session_id,
+                    title=self._session_title,
                 )
                 if committed:
                     self._emit("memory_committed", count=len(committed), entries=committed)
+            except (OSError, TypeError, UnicodeError, ValueError) as exc:
+                self._emit("memory_error", error=str(exc))
+        elif self.session_store is not None:
+            try:
+                self.session_store.archive(
+                    self._current_task,
+                    result.answer,
+                    result.success,
+                    self.messages,
+                    session_id=self._session_id,
+                    title=self._session_title,
+                )
             except (OSError, TypeError, UnicodeError, ValueError) as exc:
                 self._emit("memory_error", error=str(exc))
         self._emit(

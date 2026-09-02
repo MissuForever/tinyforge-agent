@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 from .agent import Agent, AgentEvent, AgentResult
 from .config import Config
-from .memory import redact_secrets
+from .memory import MemoryStore, redact_secrets
 from .runtime import build_agent
 from .workspace_view import is_sensitive_workspace_path as _is_sensitive_path
 
@@ -583,6 +583,59 @@ class AgentWorker:
             if self._agent is not None:
                 self._agent.reset()
             return True
+
+    @staticmethod
+    def _session_store(config: Config) -> MemoryStore:
+        return MemoryStore(
+            config.state_dir,
+            config.workspace,
+            archive_sessions=config.archive_sessions,
+        )
+
+    def list_sessions(self, config: Config, *, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            if self._active_run_id is not None:
+                return []
+        return self._session_store(config).list_sessions(limit=limit)
+
+    def current_session_id(self) -> str | None:
+        with self._lock:
+            if self._agent is None:
+                return None
+            value = getattr(self._agent, "session_id", None)
+            return str(value) if value else None
+
+    def restore_session(self, config: Config, session_id: str) -> dict[str, Any]:
+        with self._lock:
+            if self._active_run_id is not None:
+                raise ValueError("A task is currently running")
+            if self._agent is None or self._config != config:
+                self._agent = self.builder(config, lambda event: None)
+                self._config = config
+            restorer = getattr(self._agent, "restore_session", None)
+            if not callable(restorer):
+                raise ValueError("This Agent runtime cannot restore conversations")
+            return restorer(session_id)
+
+    def rename_session(self, config: Config, session_id: str, title: str) -> dict[str, Any]:
+        with self._lock:
+            if self._active_run_id is not None:
+                raise ValueError("A task is currently running")
+            agent = self._agent if self._config == config else None
+            renamer = getattr(agent, "rename_session", None)
+            if callable(renamer):
+                return renamer(session_id, title)
+        return self._session_store(config).rename_session(session_id, title)
+
+    def delete_session(self, config: Config, session_id: str) -> bool:
+        with self._lock:
+            if self._active_run_id is not None:
+                raise ValueError("A task is currently running")
+            agent = self._agent if self._config == config else None
+            deleter = getattr(agent, "delete_session", None)
+            if callable(deleter):
+                return bool(deleter(session_id))
+        return self._session_store(config).delete_session(session_id)
 
     def memory_overview(self, *, expected_workspace: Path | None = None) -> str:
         with self._lock:

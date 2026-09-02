@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -198,6 +199,8 @@ class TinyForgeApp(QMainWindow):
     FILE_PATH_ROLE = int(Qt.ItemDataRole.UserRole)
     FILE_KIND_ROLE = FILE_PATH_ROLE + 1
     FILE_LOADED_ROLE = FILE_PATH_ROLE + 2
+    SESSION_ID_ROLE = FILE_PATH_ROLE + 20
+    SESSION_RESUMABLE_ROLE = SESSION_ID_ROLE + 1
     ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
     CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
     BIDI_CONTROL_RE = re.compile(r"[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
@@ -254,6 +257,7 @@ class TinyForgeApp(QMainWindow):
         self._settings_workspace: Path | None = initial_workspace if preview_config else None
         self._settings_dirty = False
         self._has_session = False
+        self._current_session_id: str | None = None
         self._closed = False
         self._closing = False
         self.current_run_id: str | None = None
@@ -347,6 +351,7 @@ class TinyForgeApp(QMainWindow):
         self._set_details_text("Select an execution step to inspect its evidence.")
         self._set_changes_text("No file changes captured.")
         self._reset_files(initial_workspace)
+        self._refresh_history()
         self._set_status("Ready", "neutral")
         self._set_stats("No task has run in this session")
 
@@ -809,6 +814,13 @@ class TinyForgeApp(QMainWindow):
         title_layout.addWidget(self.file_count_label)
         layout.addWidget(title_bar)
 
+        self.workspace_tabs = QTabWidget()
+        self.workspace_tabs.setDocumentMode(True)
+        files_page = QWidget()
+        files_layout = QVBoxLayout(files_page)
+        files_layout.setContentsMargins(0, 0, 0, 0)
+        files_layout.setSpacing(0)
+
         toolbar = QWidget()
         toolbar.setObjectName("FilesToolbar")
         toolbar_layout = QHBoxLayout(toolbar)
@@ -829,7 +841,7 @@ class TinyForgeApp(QMainWindow):
         self.file_refresh_button.clicked.connect(self._refresh_files)
         toolbar_layout.addWidget(self.file_search_entry, 1)
         toolbar_layout.addWidget(self.file_refresh_button)
-        layout.addWidget(toolbar)
+        files_layout.addWidget(toolbar)
 
         self.files_splitter = QSplitter(Qt.Orientation.Vertical)
         self.files_splitter.setChildrenCollapsible(False)
@@ -882,8 +894,69 @@ class TinyForgeApp(QMainWindow):
         self.files_splitter.setStretchFactor(0, 3)
         self.files_splitter.setStretchFactor(1, 2)
         self.files_splitter.setSizes([260, 190])
-        layout.addWidget(self.files_splitter, 1)
+        files_layout.addWidget(self.files_splitter, 1)
+        self.workspace_tabs.addTab(files_page, "Files")
+        self.workspace_tabs.addTab(self._build_history_tab(), "History")
+        layout.addWidget(self.workspace_tabs, 1)
         return tab
+
+    def _build_history_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        toolbar = QWidget()
+        toolbar_layout = QHBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(10, 7, 10, 7)
+        toolbar_layout.setSpacing(6)
+        self.history_count_label = QLabel("0 sessions")
+        self.history_count_label.setObjectName("PanelMeta")
+        self.history_refresh_button = QPushButton()
+        self.history_refresh_button.setObjectName("IconButton")
+        self.history_refresh_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload)
+        )
+        self.history_refresh_button.setToolTip("Refresh conversation history")
+        self.history_refresh_button.setAccessibleName("Refresh conversation history")
+        self.history_refresh_button.clicked.connect(self._refresh_history)
+        toolbar_layout.addWidget(self.history_count_label)
+        toolbar_layout.addStretch(1)
+        toolbar_layout.addWidget(self.history_refresh_button)
+        layout.addWidget(toolbar)
+
+        self.history_tree = QTreeWidget()
+        self.history_tree.setObjectName("HistoryTree")
+        self.history_tree.setColumnCount(2)
+        self.history_tree.setHeaderLabels(["SESSION", "UPDATED"])
+        self.history_tree.setRootIsDecorated(False)
+        self.history_tree.setUniformRowHeights(True)
+        self.history_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.history_tree.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.history_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.history_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.history_tree.setColumnWidth(1, 92)
+        self.history_tree.itemSelectionChanged.connect(self._update_history_controls)
+        self.history_tree.itemDoubleClicked.connect(lambda item, column: self._open_session())
+        layout.addWidget(self.history_tree, 1)
+
+        actions = QWidget()
+        actions_layout = QHBoxLayout(actions)
+        actions_layout.setContentsMargins(10, 8, 10, 10)
+        actions_layout.setSpacing(6)
+        self.history_open_button = QPushButton("Open")
+        self.history_open_button.setToolTip("Restore and continue the selected conversation")
+        self.history_open_button.clicked.connect(self._open_session)
+        self.history_rename_button = QPushButton("Rename")
+        self.history_rename_button.clicked.connect(self._rename_session)
+        self.history_delete_button = QPushButton("Delete")
+        self.history_delete_button.clicked.connect(self._delete_session)
+        actions_layout.addWidget(self.history_open_button)
+        actions_layout.addWidget(self.history_rename_button)
+        actions_layout.addWidget(self.history_delete_button)
+        layout.addWidget(actions)
+        self._update_history_controls()
+        return page
 
     def _build_composer(self) -> QWidget:
         panel = QFrame()
@@ -940,6 +1013,158 @@ class TinyForgeApp(QMainWindow):
         except (ConfigError, OSError, ValueError):
             return None
 
+    def _history_config(self) -> Config:
+        workspace = Path(self.workspace_entry.text()).expanduser().resolve()
+        return Config.from_env(
+            workspace,
+            model=self.model_entry.text().strip() or None,
+            wire_api=self.protocol_combo.currentText(),
+            memory_enabled=self.memory_check.isChecked(),
+            skills_enabled=self.skills_check.isChecked(),
+        )
+
+    def _selected_session_id(self) -> str | None:
+        selected = self.history_tree.selectedItems()
+        if not selected:
+            return None
+        value = selected[0].data(0, self.SESSION_ID_ROLE)
+        return str(value) if value else None
+
+    def _update_history_controls(self) -> None:
+        selected = self.history_tree.selectedItems()
+        enabled = bool(selected and self._selected_session_id()) and not self.worker.is_running
+        resumable = bool(selected and selected[0].data(0, self.SESSION_RESUMABLE_ROLE))
+        self.history_open_button.setEnabled(enabled and resumable)
+        self.history_rename_button.setEnabled(enabled)
+        self.history_delete_button.setEnabled(enabled)
+
+    def _refresh_history(self) -> None:
+        if self.worker.is_running:
+            self._update_history_controls()
+            return
+        try:
+            sessions = self.worker.list_sessions(self._history_config())
+        except (ConfigError, OSError, TypeError, ValueError):
+            sessions = []
+        previous = self._selected_session_id() or self._current_session_id
+        old_blocked = self.history_tree.blockSignals(True)
+        try:
+            self.history_tree.clear()
+            selected_item = None
+            for session in sessions:
+                updated = str(session.get("updated_at", ""))
+                item = QTreeWidgetItem(
+                    [str(session.get("title") or "Untitled session"), updated[:10]]
+                )
+                session_id = str(session.get("id", ""))
+                item.setData(0, self.SESSION_ID_ROLE, session_id)
+                item.setData(0, self.SESSION_RESUMABLE_ROLE, bool(session.get("resumable")))
+                item.setToolTip(
+                    0,
+                    f"{session.get('title', '')}\n{updated}\nID: {session_id}",
+                )
+                if not session.get("resumable", False):
+                    item.setForeground(0, QBrush(QColor(self.COLORS["muted"])))
+                    item.setToolTip(1, "Archived for audit; truncated context cannot be resumed")
+                self.history_tree.addTopLevelItem(item)
+                if session_id == previous:
+                    selected_item = item
+            if selected_item is not None:
+                self.history_tree.setCurrentItem(selected_item)
+        finally:
+            self.history_tree.blockSignals(old_blocked)
+        count = len(sessions)
+        self.history_count_label.setText(f"{count} session{'s' if count != 1 else ''}")
+        self._update_history_controls()
+
+    def _open_session(self) -> None:
+        session_id = self._selected_session_id()
+        selected = self.history_tree.selectedItems()
+        if (
+            not session_id
+            or not selected
+            or not selected[0].data(0, self.SESSION_RESUMABLE_ROLE)
+            or self.worker.is_running
+        ):
+            return
+        if not self.worker.reset():
+            return
+        try:
+            record = self.worker.restore_session(self._history_config(), session_id)
+        except (ConfigError, OSError, TypeError, ValueError) as exc:
+            self._show_local_error(str(exc))
+            return
+        self._clear_session_view()
+        self._has_session = True
+        self._current_session_id = session_id
+        messages = record.get("messages", [])
+        rendered = 0
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role", ""))
+            if role not in {"user", "assistant"}:
+                continue
+            content = str(message.get("content") or "").strip()
+            if not content:
+                continue
+            label = "You" if role == "user" else "Agent"
+            tone = "muted" if role == "user" else "success"
+            self._insert_timeline(label, "History", self._one_line(content), content, tone)
+            rendered += 1
+        self.continue_check.setChecked(True)
+        self._set_status("Restored", "success")
+        self._set_stats(f"Restored {rendered} conversation messages")
+        self._refresh_memory()
+        self._refresh_skills()
+        self.task_input.setFocus()
+
+    def _rename_session(self) -> None:
+        session_id = self._selected_session_id()
+        selected = self.history_tree.selectedItems()
+        if not session_id or not selected or self.worker.is_running:
+            return
+        current_title = selected[0].text(0)
+        title, accepted = QInputDialog.getText(
+            self,
+            "Rename conversation",
+            "Title",
+            QLineEdit.EchoMode.Normal,
+            current_title,
+        )
+        if not accepted or not title.strip():
+            return
+        try:
+            self.worker.rename_session(self._history_config(), session_id, title)
+        except (ConfigError, OSError, TypeError, ValueError) as exc:
+            self._show_local_error(str(exc))
+            return
+        self._refresh_history()
+
+    def _delete_session(self) -> None:
+        session_id = self._selected_session_id()
+        if not session_id or self.worker.is_running:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Delete conversation",
+            "Delete the selected conversation history? This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            deleted = self.worker.delete_session(self._history_config(), session_id)
+        except (ConfigError, OSError, TypeError, ValueError) as exc:
+            self._show_local_error(str(exc))
+            return
+        if deleted and self._current_session_id == session_id:
+            self._clear_session_view()
+            self._has_session = False
+            self._current_session_id = None
+        self._refresh_history()
+
     def _apply_workspace_defaults(self, workspace: Path, config: Config) -> None:
         self.model_entry.setText(config.model)
         self.protocol_combo.setCurrentText(config.wire_api)
@@ -964,8 +1189,10 @@ class TinyForgeApp(QMainWindow):
             self._set_memory_text("Memory has not been loaded for this workspace.")
             self._reset_skill_activity(clear_catalog=True, state="not_loaded")
             self._reset_terminal(workspace)
+            self._current_session_id = None
         if workspace != self._files_workspace:
             self._reset_files(workspace)
+            self._refresh_history()
         if self._settings_dirty:
             return
         if workspace == self._settings_workspace:
@@ -991,15 +1218,28 @@ class TinyForgeApp(QMainWindow):
             if preview_config is not None:
                 self._apply_workspace_defaults(workspace, preview_config)
             self._has_session = False
+            self._current_session_id = None
             self._set_memory_text("Memory has not been loaded for this workspace.")
             self._reset_skill_activity(clear_catalog=True, state="not_loaded")
             self._reset_terminal(workspace)
             self._reset_files(workspace)
+            self._refresh_history()
 
     def _new_session(self) -> None:
         if not self.worker.reset():
             return
+        self._clear_session_view()
         self._has_session = False
+        self._current_session_id = None
+        self._refresh_memory()
+        self._refresh_skills()
+        self._refresh_history()
+        self._request_files_refresh(delay_ms=0)
+        self._set_status("Ready", "neutral")
+        self._set_stats("New session")
+        self.task_input.setFocus()
+
+    def _clear_session_view(self) -> None:
         self.current_run_id = None
         self._entry_details.clear()
         self._timeline_items.clear()
@@ -1022,12 +1262,6 @@ class TinyForgeApp(QMainWindow):
         self._reset_terminal(terminal_workspace)
         self._set_details_text("Select an execution step to inspect its evidence.")
         self._set_changes_text("No file changes captured.")
-        self._refresh_memory()
-        self._refresh_skills()
-        self._request_files_refresh(delay_ms=0)
-        self._set_status("Ready", "neutral")
-        self._set_stats("New session")
-        self.task_input.setFocus()
 
     def _start_task(self) -> None:
         if self.worker.is_running:
@@ -1063,10 +1297,13 @@ class TinyForgeApp(QMainWindow):
                 "muted",
             )
             self._has_session = False
+            self._current_session_id = None
         self._tool_items.clear()
         self._round_items.clear()
         self._active_items.clear()
         continue_session = self.continue_check.isChecked() and self._has_session
+        if not continue_session:
+            self._current_session_id = None
         try:
             run_id = self.worker.start(config, task, continue_session=continue_session)
         except (OSError, TypeError, ValueError) as exc:
@@ -1115,6 +1352,8 @@ class TinyForgeApp(QMainWindow):
         ):
             widget.setEnabled(not running)
         self.stop_button.setEnabled(running)
+        self.history_refresh_button.setEnabled(not running)
+        self._update_history_controls()
         if running:
             self.progress.setRange(0, 0)
             self.progress.setVisible(True)
@@ -1361,8 +1600,10 @@ class TinyForgeApp(QMainWindow):
         self._set_stats(stats)
         self._has_session = True
         self._set_running(False)
+        self._current_session_id = self.worker.current_session_id()
         self._refresh_memory()
         self._refresh_skills()
+        self._refresh_history()
         self._request_files_refresh(delay_ms=0)
         self._close_after_terminal_event()
 
@@ -1376,8 +1617,10 @@ class TinyForgeApp(QMainWindow):
         self._set_stats(self._one_line(safe_error))
         self._has_session = True
         self._set_running(False)
+        self._current_session_id = self.worker.current_session_id()
         self._refresh_memory()
         self._refresh_skills()
+        self._refresh_history()
         self._request_files_refresh(delay_ms=0)
         self._close_after_terminal_event()
 

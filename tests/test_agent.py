@@ -26,6 +26,65 @@ class ScriptedModel:
 
 
 class AgentTests(unittest.TestCase):
+    def test_session_archive_is_stable_when_persistent_memory_is_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            store = MemoryStore(workspace / "state", workspace)
+            agent = Agent(
+                model=ScriptedModel(
+                    [
+                        AssistantReply("TASK_COMPLETE: First answer"),
+                        AssistantReply("TASK_COMPLETE: Second answer"),
+                    ]
+                ),
+                tools=WorkspaceTools(workspace),
+                workspace=workspace,
+                session_store=store,
+            )
+
+            agent.run("First task")
+            session_id = agent.session_id
+            agent.run("Second task", continue_session=True)
+
+            self.assertIsNotNone(session_id)
+            self.assertEqual(agent.session_id, session_id)
+            self.assertEqual(len(store.list_sessions()), 1)
+            loaded = store.load_session(str(session_id))
+            self.assertEqual(
+                [message["content"] for message in loaded["messages"] if message["role"] == "user"],
+                ["First task", "Second task"],
+            )
+
+    def test_archived_session_can_be_restored_with_a_fresh_system_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            store = MemoryStore(workspace / "state", workspace)
+            store.archive(
+                "Repair project",
+                "Done",
+                True,
+                [
+                    {"role": "system", "content": "untrusted old system prompt"},
+                    {"role": "user", "content": "Repair project"},
+                    {"role": "assistant", "content": "Done"},
+                ],
+                session_id="resume-me",
+                title="Repair project",
+            )
+            agent = Agent(
+                model=ScriptedModel([]),
+                tools=WorkspaceTools(workspace),
+                workspace=workspace,
+                session_store=store,
+            )
+
+            record = agent.restore_session("resume-me")
+
+            self.assertEqual(record["title"], "Repair project")
+            self.assertEqual(agent.session_id, "resume-me")
+            self.assertNotIn("untrusted old system prompt", agent.messages[0]["content"])
+            self.assertEqual([message["role"] for message in agent.messages], ["system", "user", "assistant"])
+
     def test_tool_result_is_returned_to_model(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             model = ScriptedModel(

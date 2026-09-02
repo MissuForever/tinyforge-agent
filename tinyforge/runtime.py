@@ -28,15 +28,14 @@ def build_agent(config: Config, *, on_event: EventHandler | None = None) -> Agen
         allow_dangerous=config.allow_dangerous,
     )
     memory = None
+    session_store = MemoryStore(
+        config.state_dir,
+        config.workspace,
+        archive_sessions=config.archive_sessions,
+    )
     providers = [workspace_tools]
     if config.memory_enabled:
-        memory = MemoryRuntime(
-            MemoryStore(
-                config.state_dir,
-                config.workspace,
-                archive_sessions=config.archive_sessions,
-            )
-        )
+        memory = MemoryRuntime(session_store)
         providers.append(memory)
     skills = SkillRuntime(
         SkillCatalog(config.workspace, config.user_skills_dir),
@@ -54,6 +53,7 @@ def build_agent(config: Config, *, on_event: EventHandler | None = None) -> Agen
         max_context_tokens=config.max_context_tokens,
         on_event=on_event,
         memory=memory,
+        session_store=session_store,
         skills=skills,
         skills_enabled=config.skills_enabled,
     )

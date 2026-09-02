@@ -16,8 +16,8 @@ Chat Completions 或 Responses API，解析模型原生 tool calling，在本机
 - `edit_file`：精确局部替换，避免意外修改多处内容
 - `run_command`：在工作区执行 PowerShell 或 POSIX shell 命令
 - 可选本地 Skills：任务感知 Top-K 推荐、版本 receipt、资源快照和只读失败归因，默认关闭
-- 单任务与连续对话两种 CLI 使用方式
-- PySide6 桌面操作台：执行时间线、代码 Diff、记忆、命令输出和工作区文件总览
+- 单任务、连续对话和可恢复历史会话三种 CLI 使用方式
+- PySide6 桌面操作台：历史会话、执行时间线、代码 Diff、记忆、命令输出和工作区文件总览
 - 工具异常结构化回传，模型可读取错误并自行修正
 - 命令超时、工作区路径隔离、危险命令拦截
 - 工具输出截断、对话上下文裁剪、最大轮数和重复调用保护
@@ -101,9 +101,10 @@ py -3 -m tinyforge.gui
 Resource reads 和 Adaptation 展示检索及版本证据，成功加载也会进入执行时间线。中间下方的
 `Command output` 面板会按行显示 Agent
 执行的命令、标准输出、错误输出和退出码；它是只读审计视图，不提供任意命令输入入口。
-最左侧的 `Workspace` 面板在后台索引 Git 可见文件，支持文件名过滤、Git 状态和带行号的
-只读预览；非 Git 工作区会使用有界扫描，敏感路径、缓存目录、目录链接、二进制文件和
-过大文件不会自动读取。
+最左侧的 `Workspace` 面板提供 `Files / History` 两个标签。Files 在后台索引 Git 可见文件，
+支持文件名过滤、Git 状态和带行号的只读预览；History 可打开、重命名、删除并继续历史会话。
+非 Git 工作区会使用有界扫描，敏感路径、缓存目录、目录链接、二进制文件和过大文件不会
+自动读取。
 
 需要保留主屏工作时，可让窗口直接在副屏居中打开，无需手动拖动：
 
@@ -114,8 +115,10 @@ py -3 -m tinyforge.gui --secondary-screen
 该模式首次显示时不抢键盘焦点、不会置顶；点击副屏窗口后仍可正常交互。没有副屏时会回退
 到系统默认显示器。
 
-交互模式支持 `/new` 清空上下文、`/memory` 查看工作记忆与 L1 索引、`/skills` 查看本次
-会话的 Skill 目录和加载状态、`/help` 查看命令、`/exit` 退出。也可以安装命令行入口：
+交互模式支持 `/new` 清空上下文、`/history` 列出历史、`/open ID` 恢复会话、
+`/rename ID TITLE` 重命名、`/delete ID` 删除、`/memory` 查看工作记忆与 L1 索引、
+`/skills` 查看本次会话的 Skill 目录和加载状态、`/help` 查看命令、`/exit` 退出。
+也可以安装命令行入口：
 
 ```powershell
 py -3 -m pip install -e .
@@ -166,13 +169,15 @@ tinyforge-gui --help
 index.json       L1：默认注入的有界标题/关键词索引
 facts/*.json     L2：经工具证据验证的稳定事实
 sops/*.json      L3：经验证的可复用工作流程
-sessions/*.json  L4：脱敏并限长的任务档案，不默认注入上下文
+sessions/*.json  L4：稳定 ID、脱敏且限长的可管理会话档案
 ```
 
 Agent 通过 `recall_memory` 按需读取 L2/L3，并返回条目自带的证据摘要。`stage_memory` 只暂存
 候选；模型以 `TASK_COMPLETE:` 明确结束且收尾证据复检通过后才提交，失败任务则丢弃。
 SOP 必须引用最后一次文件修改或未验证命令之后、可识别的测试/检查命令证据。可使用
-`--no-memory` 做无记忆对照，或用 `--no-session-archive` 保留 L1-L3 但关闭 L4。
+`--no-memory` 做无记忆对照；会话归档与长期记忆开关相互独立，使用
+`--no-session-archive` 才会关闭 L4。恢复时 Runtime 丢弃归档中的 system 消息并重新生成
+当前可信系统提示；因容量限制而截断的档案仅供审计，不能继续对话。
 
 ## 本地 Skills
 

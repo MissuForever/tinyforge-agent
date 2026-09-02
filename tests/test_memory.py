@@ -427,6 +427,68 @@ class MemoryRuntimeTests(unittest.TestCase):
         archive_path = next((self.store.root / "sessions").glob("*.json"))
         archive_path.read_text(encoding="utf-8")
 
+    def test_session_archive_has_stable_identity_and_management(self) -> None:
+        first_id = self.store.archive(
+            "First task",
+            "First answer",
+            True,
+            [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "First task"},
+                {"role": "assistant", "content": "First answer"},
+            ],
+            session_id="stable-session",
+            title="Project repair",
+        )
+        self.store.archive(
+            "Follow-up",
+            "Second answer",
+            True,
+            [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "First task"},
+                {"role": "assistant", "content": "First answer"},
+                {"role": "user", "content": "Follow-up"},
+                {"role": "assistant", "content": "Second answer"},
+            ],
+            session_id="stable-session",
+            title="Project repair",
+        )
+
+        self.assertEqual(first_id, "stable-session")
+        self.assertEqual(len(list((self.store.root / "sessions").glob("*.json"))), 1)
+        sessions = self.store.list_sessions()
+        self.assertEqual(sessions[0]["id"], "stable-session")
+        self.assertEqual(sessions[0]["message_count"], 5)
+        self.assertTrue(sessions[0]["resumable"])
+
+        renamed = self.store.rename_session("stable-session", "Release follow-up")
+        self.assertEqual(renamed["title"], "Release follow-up")
+        loaded = self.store.load_session("stable-session")
+        self.assertEqual(loaded["title"], "Release follow-up")
+        self.assertEqual(loaded["task"], "Follow-up")
+        self.assertTrue(self.store.delete_session("stable-session"))
+        self.assertFalse(self.store.delete_session("stable-session"))
+        self.assertEqual(self.store.list_sessions(), [])
+
+    def test_session_management_rejects_path_traversal_and_wrong_workspace(self) -> None:
+        with self.assertRaises(ValueError):
+            self.store.load_session("../outside")
+        self.store.archive(
+            "Inspect",
+            "Done",
+            True,
+            [{"role": "user", "content": "Inspect"}],
+            session_id="owned-session",
+        )
+        archive_path = self.store.root / "sessions" / "owned-session.json"
+        record = json.loads(archive_path.read_text(encoding="utf-8"))
+        record["workspace"] = str(self.workspace.parent / "other")
+        archive_path.write_text(json.dumps(record), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.store.load_session("owned-session")
+        self.assertEqual(self.store.list_sessions(), [])
+
     def test_l1_index_is_bounded_and_workspaces_are_isolated(self) -> None:
         for number in range(40):
             self.store.commit(
