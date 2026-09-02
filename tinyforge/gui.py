@@ -266,7 +266,6 @@ class TinyForgeApp(QMainWindow):
         self._item_sequence = 0
         self._terminal_commands: dict[str, _TerminalCommandState] = {}
         self._terminal_command_count = 0
-        self._terminal_auto_opened = False
         self._terminal_workspace = initial_workspace
         self._files_workspace = initial_workspace
         self._file_index: WorkspaceIndex | None = None
@@ -409,8 +408,8 @@ class TinyForgeApp(QMainWindow):
             QTabWidget::pane {{ background: #ffffff; border: 0; border-top: 1px solid {self.COLORS['border']}; }}
             QTabBar {{ background: #f2f4f5; }}
             QTabBar::tab {{
-                background: #f2f4f5; color: #5c686f; border: 0; padding: 10px 17px;
-                min-width: 80px; font-weight: 600;
+                background: #f2f4f5; color: #5c686f; border: 0; padding: 9px 4px;
+                min-width: 42px; font-size: 9pt; font-weight: 600;
             }}
             QTabBar::tab:selected {{ background: #ffffff; color: {self.COLORS['accent']}; border-bottom: 2px solid {self.COLORS['accent']}; }}
             QPlainTextEdit {{
@@ -444,7 +443,9 @@ class TinyForgeApp(QMainWindow):
             QLabel#ShortcutHint {{ color: #7a858b; font-size: 8.5pt; }}
             QProgressBar {{ background: #dfe5e7; border: 0; border-radius: 2px; max-height: 4px; }}
             QProgressBar::chunk {{ background: {self.COLORS['accent']}; border-radius: 2px; }}
-            QSplitter::handle {{ background: {self.COLORS['canvas']}; width: 8px; }}
+            QSplitter::handle {{ background: {self.COLORS['canvas']}; }}
+            QSplitter::handle:horizontal {{ width: 8px; }}
+            QSplitter::handle:vertical {{ height: 8px; }}
             """
         )
 
@@ -473,12 +474,28 @@ class TinyForgeApp(QMainWindow):
         content_layout.setContentsMargins(18, 14, 18, 12)
         content_layout.setSpacing(12)
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter.setObjectName("MainSplitter")
         self.main_splitter.setChildrenCollapsible(False)
-        self.main_splitter.addWidget(self._build_timeline_panel())
+        self.main_splitter.setHandleWidth(8)
+        self.main_splitter.addWidget(self._build_files_tab())
+
+        self.center_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.center_splitter.setObjectName("CenterSplitter")
+        self.center_splitter.setChildrenCollapsible(False)
+        self.center_splitter.setHandleWidth(8)
+        self.center_splitter.setMinimumWidth(360)
+        self.center_splitter.addWidget(self._build_timeline_panel())
+        self.center_splitter.addWidget(self._build_terminal_panel())
+        self.center_splitter.setStretchFactor(0, 3)
+        self.center_splitter.setStretchFactor(1, 2)
+        self.center_splitter.setSizes([430, 220])
+        self.main_splitter.addWidget(self.center_splitter)
+
         self.main_splitter.addWidget(self._build_inspector())
-        self.main_splitter.setStretchFactor(0, 3)
-        self.main_splitter.setStretchFactor(1, 2)
-        self.main_splitter.setSizes([820, 560])
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 3)
+        self.main_splitter.setStretchFactor(2, 2)
+        self.main_splitter.setSizes([280, 700, 410])
         content_layout.addWidget(self.main_splitter, 1)
         outer.addWidget(content, 1)
         outer.addWidget(self._build_composer())
@@ -586,6 +603,8 @@ class TinyForgeApp(QMainWindow):
     def _build_timeline_panel(self) -> QWidget:
         panel = QFrame()
         panel.setObjectName("ToolPanel")
+        panel.setMinimumHeight(180)
+        self.timeline_panel = panel
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -618,6 +637,35 @@ class TinyForgeApp(QMainWindow):
         layout.addWidget(self.timeline, 1)
         return panel
 
+    def _build_terminal_panel(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("ToolPanel")
+        panel.setMinimumHeight(130)
+        self.terminal_panel = panel
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        title_bar = QWidget()
+        title_layout = QHBoxLayout(title_bar)
+        title_layout.setContentsMargins(14, 9, 12, 8)
+        title = QLabel("Command output")
+        title.setObjectName("PanelTitle")
+        self.terminal_count_label = QLabel("0 commands")
+        self.terminal_count_label.setObjectName("PanelMeta")
+        title_layout.addWidget(title)
+        title_layout.addStretch(1)
+        title_layout.addWidget(self.terminal_count_label)
+        layout.addWidget(title_bar)
+
+        self.terminal_text = self._make_inspector_text(code=True, wrap=False)
+        self.terminal_text.setObjectName("TerminalText")
+        self.terminal_text.setAccessibleName("Command output")
+        self.terminal_text.setUndoRedoEnabled(False)
+        self._terminal_highlighter = TerminalHighlighter(self.terminal_text.document())
+        layout.addWidget(self.terminal_text, 1)
+        return panel
+
     def _make_inspector_text(self, *, code: bool, wrap: bool) -> QPlainTextEdit:
         text = QPlainTextEdit()
         text.setObjectName("CodeText" if code else "InspectorText")
@@ -634,34 +682,46 @@ class TinyForgeApp(QMainWindow):
     def _build_inspector(self) -> QWidget:
         panel = QFrame()
         panel.setObjectName("ToolPanel")
+        panel.setMinimumWidth(280)
+        self.inspector_panel = panel
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         self.inspector = QTabWidget()
         self.inspector.setDocumentMode(True)
+        self.inspector.tabBar().setExpanding(True)
+        self.inspector.tabBar().setUsesScrollButtons(False)
         self.details_text = self._make_inspector_text(code=False, wrap=True)
         self.changes_text = self._make_inspector_text(code=True, wrap=False)
         self.memory_text = self._make_inspector_text(code=True, wrap=True)
-        self.terminal_text = self._make_inspector_text(code=True, wrap=False)
-        self.terminal_text.setObjectName("TerminalText")
-        self.terminal_text.setUndoRedoEnabled(False)
         self._diff_highlighter = DiffHighlighter(self.changes_text.document())
         self._memory_highlighter = MemoryHighlighter(self.memory_text.document())
-        self._terminal_highlighter = TerminalHighlighter(self.terminal_text.document())
         self.inspector.addTab(self.details_text, "Details")
         self.inspector.addTab(self.changes_text, "Changes")
         self.inspector.addTab(self.memory_text, "Memory")
-        self.inspector.addTab(self.terminal_text, "Terminal")
-        self.inspector.addTab(self._build_files_tab(), "Files")
         layout.addWidget(self.inspector)
         return panel
 
     def _build_files_tab(self) -> QWidget:
-        tab = QWidget()
-        tab.setObjectName("FilesTab")
+        tab = QFrame()
+        tab.setObjectName("ToolPanel")
+        tab.setMinimumWidth(220)
         self.files_tab = tab
+        self.workspace_panel = tab
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
+
+        title_bar = QWidget()
+        title_layout = QHBoxLayout(title_bar)
+        title_layout.setContentsMargins(14, 11, 12, 9)
+        title = QLabel("Workspace")
+        title.setObjectName("PanelTitle")
+        self.file_count_label = QLabel("0 files")
+        self.file_count_label.setObjectName("PanelMeta")
+        title_layout.addWidget(title)
+        title_layout.addStretch(1)
+        title_layout.addWidget(self.file_count_label)
+        layout.addWidget(title_bar)
 
         toolbar = QWidget()
         toolbar.setObjectName("FilesToolbar")
@@ -673,8 +733,6 @@ class TinyForgeApp(QMainWindow):
         self.file_search_entry.setClearButtonEnabled(True)
         self.file_search_entry.setAccessibleName("Filter workspace files")
         self.file_search_entry.textChanged.connect(self._schedule_file_filter)
-        self.file_count_label = QLabel("0 files")
-        self.file_count_label.setObjectName("PanelMeta")
         self.file_refresh_button = QPushButton()
         self.file_refresh_button.setObjectName("IconButton")
         self.file_refresh_button.setIcon(
@@ -684,7 +742,6 @@ class TinyForgeApp(QMainWindow):
         self.file_refresh_button.setAccessibleName("Refresh workspace files")
         self.file_refresh_button.clicked.connect(self._refresh_files)
         toolbar_layout.addWidget(self.file_search_entry, 1)
-        toolbar_layout.addWidget(self.file_count_label)
         toolbar_layout.addWidget(self.file_refresh_button)
         layout.addWidget(toolbar)
 
@@ -1241,7 +1298,6 @@ class TinyForgeApp(QMainWindow):
         self.file_search_entry.blockSignals(previous)
         self.file_tree.clear()
         self.file_count_label.setText("Loading")
-        self.inspector.setTabText(self.inspector.indexOf(self.files_tab), "Files")
         self._set_file_preview_message("Select a file", "Select a file to preview.")
         self._start_file_refresh(resolved, None)
 
@@ -1395,10 +1451,6 @@ class TinyForgeApp(QMainWindow):
         total = len(index.files)
         suffix = "+" if index.truncated else ""
         self.file_count_label.setText(f"{total}{suffix} files")
-        self.inspector.setTabText(
-            self.inspector.indexOf(self.files_tab),
-            f"Files ({total}{suffix})" if total else "Files",
-        )
         if index.error:
             self._selected_file_path = None
             self._render_file_message(index.error)
@@ -1887,9 +1939,8 @@ class TinyForgeApp(QMainWindow):
         self.terminal_text.clear()
         self._terminal_commands.clear()
         self._terminal_command_count = 0
-        self._terminal_auto_opened = False
         self._terminal_workspace = workspace
-        self.inspector.setTabText(self.inspector.indexOf(self.terminal_text), "Terminal")
+        self.terminal_count_label.setText("0 commands")
 
     def _start_terminal_command(self, call_id: str, arguments: object) -> None:
         if not call_id or not isinstance(arguments, dict):
@@ -1907,13 +1958,8 @@ class TinyForgeApp(QMainWindow):
         self._append_terminal(rendered)
         self._terminal_commands[call_id] = _TerminalCommandState()
         self._terminal_command_count += 1
-        self.inspector.setTabText(
-            self.inspector.indexOf(self.terminal_text),
-            f"Terminal ({self._terminal_command_count})",
-        )
-        if not self._terminal_auto_opened:
-            self.inspector.setCurrentWidget(self.terminal_text)
-            self._terminal_auto_opened = True
+        unit = "command" if self._terminal_command_count == 1 else "commands"
+        self.terminal_count_label.setText(f"{self._terminal_command_count} {unit}")
 
     def _append_terminal_output(self, call_id: str, stream: str, text: str) -> None:
         state = self._terminal_commands.get(call_id)

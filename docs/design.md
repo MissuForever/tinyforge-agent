@@ -95,12 +95,12 @@ GUI 线程只负责 Qt 控件渲染，`Agent.run()` 在单独的 daemon 线程�
 文本快照，生成用于审计的 unified diff。这样耗时的网络与命令操作不阻塞 Qt 事件循环，
 同时所有控件变更仍发生在 GUI 线程。
 
-只读 `Terminal` 标签逐行标记 command/stdout/stderr，并把退出码作为独立系统状态展示，
+中间下方的只读 `Command output` 面板逐行标记 command/stdout/stderr，并把退出码作为独立系统状态展示，
 避免工具输出伪造成功状态。ANSI、控制字符、双向文本控制符和凭据会在显示前清理或脱敏；
 跨事件片段先聚合成有界行，超长单行直接省略，总历史也有硬上限。命令结束时提供给模型
 和记忆模块的仍是原有结构化 JSON，GUI 进度事件不会改变证据判定。
 
-`Files` 标签使用独立的只读索引，不把 Agent 的递归 `list_files` 直接暴露给界面。Git
+最左侧的 `Workspace` 面板使用独立的只读索引，不把 Agent 的递归 `list_files` 直接暴露给界面。Git
 工作区通过 `git ls-files --cached --others --exclude-standard` 复用完整 ignore 语义，再用
 porcelain 状态标记修改、添加和未跟踪文件；非 Git 工作区回退为条目数受限的本地扫描。
 索引和预览均在后台线程运行，并用工作区代次丢弃切换目录后的迟到结果。目录链接不递归，

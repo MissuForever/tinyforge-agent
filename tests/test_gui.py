@@ -280,13 +280,19 @@ class GuiWidgetTests(unittest.TestCase):
         self.assertTrue(selected_text.isValid())
         self.assertNotEqual(selected_background.rgba(), selected_text.rgba())
 
-    def test_terminal_is_a_read_only_inspector_tab(self) -> None:
+    def test_command_output_is_a_read_only_standalone_bottom_panel(self) -> None:
         assert Qt is not None
         assert QPlainTextEdit is not None
-        self.assertEqual(self.app.inspector.count(), 5)
-        terminal_index = self.app.inspector.indexOf(self.app.terminal_text)
-        self.assertEqual(self.app.inspector.tabText(terminal_index), "Terminal")
-        self.assertIs(self.app.inspector.widget(terminal_index), self.app.terminal_text)
+        self.assertEqual(self.app.inspector.count(), 3)
+        self.assertFalse(self.app.inspector.tabBar().usesScrollButtons())
+        self.assertEqual(self.app.inspector.indexOf(self.app.terminal_text), -1)
+        self.assertEqual(self.app.center_splitter.orientation(), Qt.Orientation.Vertical)
+        self.assertIs(self.app.center_splitter.widget(0), self.app.timeline_panel)
+        self.assertIs(self.app.center_splitter.widget(1), self.app.terminal_panel)
+        self.assertTrue(self.app.terminal_panel.isAncestorOf(self.app.terminal_text))
+        self.assertTrue(self.app.terminal_panel.isVisibleTo(self.app))
+        self.assertGreater(self.app.center_splitter.sizes()[1], 0)
+        self.assertEqual(self.app.terminal_count_label.text(), "0 commands")
         self.assertTrue(self.app.terminal_text.isReadOnly())
         self.assertFalse(self.app.terminal_text.isUndoRedoEnabled())
         self.assertEqual(
@@ -298,12 +304,22 @@ class GuiWidgetTests(unittest.TestCase):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
         )
 
-    def test_files_is_a_read_only_fifth_inspector_tab(self) -> None:
+    def test_workspace_files_are_a_read_only_left_sidebar(self) -> None:
+        assert Qt is not None
         assert QPlainTextEdit is not None
-        files_index = self.app.inspector.indexOf(self.app.files_tab)
-        self.assertEqual(files_index, 4)
-        self.assertTrue(self.app.inspector.tabText(files_index).startswith("Files"))
-        self.assertIs(self.app.inspector.widget(files_index), self.app.files_tab)
+        self.assertEqual(self.app.main_splitter.orientation(), Qt.Orientation.Horizontal)
+        self.assertEqual(self.app.main_splitter.count(), 3)
+        self.assertIs(self.app.main_splitter.widget(0), self.app.workspace_panel)
+        self.assertIs(self.app.main_splitter.widget(1), self.app.center_splitter)
+        self.assertIs(self.app.main_splitter.widget(2), self.app.inspector_panel)
+        self.assertEqual(self.app.inspector.indexOf(self.app.files_tab), -1)
+        self.assertTrue(self.app.workspace_panel.isAncestorOf(self.app.file_tree))
+        self.assertTrue(self.app.workspace_panel.isAncestorOf(self.app.file_search_entry))
+        self.assertTrue(self.app.workspace_panel.isAncestorOf(self.app.file_refresh_button))
+        self.assertTrue(self.app.workspace_panel.isVisibleTo(self.app))
+        self.assertFalse(self.app.main_splitter.childrenCollapsible())
+        self.assertFalse(self.app.center_splitter.childrenCollapsible())
+        self.assertGreater(self.app.main_splitter.sizes()[0], 0)
         self.assertTrue(self.app.file_preview_text.isReadOnly())
         self.assertFalse(self.app.file_preview_text.isUndoRedoEnabled())
         self.assertEqual(
@@ -511,10 +527,7 @@ class GuiWidgetTests(unittest.TestCase):
         self.app.file_tree.expandItem(self.app._file_items["src"])
         self.qt_app.processEvents()
         self.assertEqual(self.app._file_items["src/app.py"].text(1), "M")
-        self.assertEqual(
-            self.app.inspector.tabText(self.app.inspector.indexOf(self.app.files_tab)),
-            "Files (2)",
-        )
+        self.assertEqual(self.app.file_count_label.text(), "2 files")
 
     def test_successful_file_tools_schedule_refresh_and_failed_tools_do_not(self) -> None:
         assert AgentEvent is not None
@@ -630,9 +643,11 @@ class GuiWidgetTests(unittest.TestCase):
                 "arguments": {"command": "python -m unittest", "cwd": "tests"},
             },
         )
+        self.app.inspector.setCurrentWidget(self.app.details_text)
         self.app._render_agent_event(start)
-        self.assertIs(self.app.inspector.currentWidget(), self.app.terminal_text)
-        self.assertEqual(self.app.inspector.tabText(3), "Terminal (1)")
+        self.assertIs(self.app.inspector.currentWidget(), self.app.details_text)
+        self.assertEqual(self.app.terminal_count_label.text(), "1 command")
+        self.assertTrue(self.app.terminal_panel.isVisibleTo(self.app))
         prompt = "PS tests> " if os.name == "nt" else "$ tests> "
         self.assertIn(prompt + "python -m unittest", self.app.terminal_text.toPlainText())
 
@@ -977,9 +992,8 @@ class GuiWidgetTests(unittest.TestCase):
 
         self.app._new_session()
         self.assertEqual(self.app.terminal_text.toPlainText(), "")
-        self.assertEqual(self.app.inspector.tabText(3), "Terminal")
+        self.assertEqual(self.app.terminal_count_label.text(), "0 commands")
         self.assertEqual(self.app._terminal_commands, {})
-        self.assertFalse(self.app._terminal_auto_opened)
 
     def test_terminal_cleans_secrets_controls_and_bounds_history(self) -> None:
         secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
@@ -1028,7 +1042,6 @@ class GuiWidgetTests(unittest.TestCase):
         self.assertIn("line-7", history)
 
     def test_terminal_preserves_manual_scroll_and_follows_latest_at_bottom(self) -> None:
-        self.app.inspector.setCurrentWidget(self.app.terminal_text)
         self.app._append_terminal("".join(f"line {index}\n" for index in range(600)))
         self.qt_app.processEvents()
         scroll = self.app.terminal_text.verticalScrollBar()
@@ -1208,6 +1221,9 @@ class GuiWidgetTests(unittest.TestCase):
         self.assertIn("[stderr] Authorization: Bearer [REDACTED]", terminal)
         self.assertIn("[exit 0]", terminal)
         self.assertNotIn("ABCDEFGHIJKLMNOPQRSTUVWX", terminal)
+        self.assertIs(self.app.center_splitter.widget(1), self.app.terminal_panel)
+        self.assertTrue(self.app.terminal_panel.isVisibleTo(self.app))
+        self.assertEqual(self.app.terminal_count_label.text(), "1 command")
         self.assertEqual(self.app.status_label.text(), "Completed")
 
 

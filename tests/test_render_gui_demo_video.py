@@ -75,6 +75,21 @@ class RenderGuiDemoVideoTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 parser.parse_args(["--tts-proxy", "http://proxy", "--no-tts-proxy"])
 
+    def test_memory_card_uses_evidence_ids_from_the_recorded_run(self) -> None:
+        assert render is not None
+        memory = (
+            "verified_evidence: e11=edit_file:pricing.py (replacements=1) | "
+            "e12=read_file:pricing.py | "
+            "e13=run_command:exit=0 for python -m unittest discover"
+        )
+        self.assertEqual(
+            render.memory_evidence_lines(memory),
+            (
+                "e11  edit_file: pricing.py (replacements=1)",
+                "e13  run_command: 4 tests OK, exit=0",
+            ),
+        )
+
     def test_auto_uses_edge_for_the_complete_batch(self) -> None:
         assert render is not None
         with tempfile.TemporaryDirectory() as temp:

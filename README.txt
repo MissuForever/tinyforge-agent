@@ -4,7 +4,7 @@ Git 仓库：https://github.com/MissuForever/tinyforge-agent
 
 运行环境：Python 3.10 及以上。复制 .env.example 为 .env，填写 TINYFORGE_API_KEY、TINYFORGE_BASE_URL 和 TINYFORGE_MODEL，然后执行：
 py -3 -m tinyforge "你的编程任务"
-核心 Runtime 和 CLI 无第三方运行时依赖。图形界面需先执行 py -3 -m pip install -e ".[gui]"，再执行 py -3 -m tinyforge.gui；需要直接在副屏打开且不抢焦点时执行 py -3 -m tinyforge.gui --secondary-screen。PySide6 界面可实时查看执行时间线、工具详情、代码 Diff、记忆概览、命令输出和工作区文件总览。Files 标签支持文件名过滤、Git 状态以及带行号的安全只读预览。操作其他项目可增加 -w 项目路径；不提供任务则进入连续对话。运行测试：
+核心 Runtime 和 CLI 无第三方运行时依赖。图形界面需先执行 py -3 -m pip install -e ".[gui]"，再执行 py -3 -m tinyforge.gui；需要直接在副屏打开且不抢焦点时执行 py -3 -m tinyforge.gui --secondary-screen。PySide6 界面可实时查看执行时间线、工具详情、代码 Diff、记忆概览、命令输出和工作区文件总览。最左侧 Workspace 面板支持文件名过滤、Git 状态以及带行号的安全只读预览，中间下方独立显示 Agent 的命令及输出。操作其他项目可增加 -w 项目路径；不提供任务则进入连续对话。运行测试：
 py -3 -m unittest discover -s tests -v
 离屏 GUI 检查（PowerShell）：$env:QT_QPA_PLATFORM="offscreen"; py -3 -m tinyforge.gui --smoke-test; Remove-Item Env:QT_QPA_PLATFORM
 

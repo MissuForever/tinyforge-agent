@@ -34,7 +34,7 @@ FFMPEG = (
 )
 WINDOW_TITLE = "TinyForge 0.3.0 - Live GUI Demo"
 WINDOW_WIDTH = 1_020
-WINDOW_HEIGHT = 640
+WINDOW_HEIGHT = 720
 TEST_COMMAND = "python -m unittest discover -s tests -t . -v"
 TASK = (
     "阅读 README.md、pricing.py 和完整测试。先使用 run_command 运行 "
@@ -70,7 +70,11 @@ def _run(
 def _snapshot(workspace: Path) -> dict[str, str]:
     snapshot: dict[str, str] = {}
     for path in sorted(workspace.rglob("*")):
-        if path.is_file() and "__pycache__" not in path.parts:
+        if (
+            path.is_file()
+            and "__pycache__" not in path.parts
+            and ".git" not in path.parts
+        ):
             snapshot[path.relative_to(workspace).as_posix()] = path.read_text(
                 encoding="utf-8", errors="replace"
             )
@@ -391,6 +395,7 @@ class DemoController:
             ("result_live", self._show_result, 4_000),
             ("baseline_evidence", self._show_failed_test, 5_500),
             ("code_changes", self._show_changes, 6_500),
+            ("workspace_files", self._show_files, 6_500),
             ("verification_evidence", self._show_passed_test, 5_500),
             ("persistent_memory", self._show_memory, 6_500),
             ("final_result", self._show_result, 5_000),
@@ -402,6 +407,12 @@ class DemoController:
                 return
             name, action, duration = stages[index]
             action()
+            if name == "workspace_files":
+                self._wait_for_files_showcase(
+                    deadline=time.monotonic() + 8.0,
+                    on_ready=lambda: self._after(duration, advance, index + 1),
+                )
+                return
             self.mark(name)
             self._after(duration, advance, index + 1)
 
@@ -429,9 +440,23 @@ class DemoController:
 
     def _show_failed_test(self) -> None:
         self._select_test_evidence(success=False)
+        self._focus_terminal_output("[stderr] FAILED (failures=3)", last=False)
 
     def _show_passed_test(self) -> None:
+        self.app.main_splitter.setSizes([250, 430, 288])
         self._select_test_evidence(success=True)
+        self._focus_terminal_output("[stderr] OK", last=True)
+
+    def _focus_terminal_output(self, needle: str, *, last: bool) -> bool:
+        text = self.app.terminal_text.toPlainText()
+        position = text.rfind(needle) if last else text.find(needle)
+        if position < 0:
+            return False
+        cursor = self.app.terminal_text.textCursor()
+        cursor.setPosition(position)
+        self.app.terminal_text.setTextCursor(cursor)
+        self.app.terminal_text.centerCursor()
+        return True
 
     def _select_test_evidence(self, *, success: bool) -> bool:
         state = "Succeeded" if success else "Failed"
@@ -465,6 +490,58 @@ class DemoController:
     def _show_changes(self) -> None:
         self.app.inspector.setCurrentIndex(1)
         self.app.changes_text.verticalScrollBar().setValue(0)
+
+    def _show_files(self) -> None:
+        self.app.main_splitter.setSizes([310, 370, 288])
+        self.app.files_splitter.setSizes([125, 165])
+        self.app.file_search_entry.clear()
+        self.app._request_files_refresh("pricing.py", delay_ms=0)
+
+    def _wait_for_files_showcase(
+        self,
+        *,
+        deadline: float,
+        on_ready: Callable[[], None],
+    ) -> None:
+        entry = self.app._file_entries.get("pricing.py")
+        item = self.app._file_items.get("pricing.py")
+        if item is not None and self.app._selected_file_path != "pricing.py":
+            self.app.file_tree.setCurrentItem(item)
+        preview_ready = (
+            self.app.file_preview_meta.text() != "Loading"
+            and "order_total" in self.app.file_preview_text.toPlainText()
+        )
+        if (
+            self.app.file_refresh_button.isEnabled()
+            and entry is not None
+            and item is not None
+            and self.app._selected_file_path == "pricing.py"
+            and preview_ready
+            and "M" in entry.git_status
+        ):
+            self.app.file_tree.scrollToItem(
+                item,
+                QAbstractItemView.ScrollHint.PositionAtCenter,
+            )
+            self.mark(
+                "workspace_files",
+                path="pricing.py",
+                git_status=entry.git_status,
+            )
+            on_ready()
+            return
+        if time.monotonic() >= deadline:
+            self.failure = "Files showcase did not become ready before its deadline"
+            self.mark("workspace_files_error")
+            self._after(1_000, self.finish)
+            return
+        self._after(
+            100,
+            lambda: self._wait_for_files_showcase(
+                deadline=deadline,
+                on_ready=on_ready,
+            ),
+        )
 
     def _show_memory(self) -> None:
         self.app.inspector.setCurrentIndex(2)
@@ -525,6 +602,28 @@ def main() -> int:
     if prepare.returncode:
         print(prepare.stdout, file=sys.stderr)
         return prepare.returncode
+
+    git_commands = [
+        ["git", "init", "--quiet"],
+        ["git", "add", "README.md", "pricing.py", "tests"],
+        [
+            "git",
+            "-c",
+            "user.name=TinyForge Demo",
+            "-c",
+            "user.email=tinyforge-demo@localhost",
+            "commit",
+            "--quiet",
+            "-m",
+            "demo baseline",
+        ],
+    ]
+    for command in git_commands:
+        initialized = _run(command, cwd=workspace)
+        if initialized.returncode:
+            print(initialized.stdout, file=sys.stderr)
+            print("Unable to create the isolated demo Git baseline.", file=sys.stderr)
+            return initialized.returncode
 
     before = _snapshot(workspace)
     baseline = _run(
@@ -605,6 +704,23 @@ def main() -> int:
     stats = app.stats_label.text()
     change_count = app._change_count
     memory_commit_count = app._memory_commit_count
+    terminal_text = app.terminal_text.toPlainText()
+    command_showcase = {
+        "visible": app.terminal_panel.isVisibleTo(app),
+        "height": app.terminal_panel.height(),
+        "count": app._terminal_command_count,
+        "has_failed_baseline": "[stderr] FAILED (failures=3)" in terminal_text,
+        "has_successful_verification": (
+            "[stderr] OK" in terminal_text and "[exit 0]" in terminal_text
+        ),
+    }
+    pricing_entry = app._file_entries.get("pricing.py")
+    files_showcase = {
+        "indexed": pricing_entry is not None,
+        "selected": app._selected_file_path == "pricing.py",
+        "preview_ready": "order_total" in app.file_preview_text.toPlainText(),
+        "git_status": pricing_entry.git_status if pricing_entry is not None else "",
+    }
     app._destroy_window()
     application.processEvents()
 
@@ -645,6 +761,9 @@ def main() -> int:
         and "ERROR" not in verification.stdout
         and "skipped=" not in verification.stdout
     )
+    files_marker_recorded = any(
+        marker.get("name") == "workspace_files" for marker in controller.markers
+    )
 
     result_data = {
         "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -673,6 +792,9 @@ def main() -> int:
             "all_passed": verification_expected,
         },
         "gui_test_evidence": gui_test_evidence,
+        "command_showcase": command_showcase,
+        "files_showcase": files_showcase,
+        "files_marker_recorded": files_marker_recorded,
         "changed_files": changed_files,
         "change_count": change_count,
         "memory_commit_count": memory_commit_count,
@@ -699,6 +821,16 @@ def main() -> int:
         and baseline_expected
         and verification_expected
         and gui_tests_verified
+        and command_showcase["visible"]
+        and command_showcase["height"] >= 120
+        and command_showcase["count"] >= 2
+        and command_showcase["has_failed_baseline"]
+        and command_showcase["has_successful_verification"]
+        and files_showcase["indexed"]
+        and files_showcase["selected"]
+        and files_showcase["preview_ready"]
+        and "M" in files_showcase["git_status"]
+        and files_marker_recorded
         and changed_files == ["pricing.py"]
         and change_count >= 1
         and memory_commit_count >= 1
@@ -711,6 +843,8 @@ def main() -> int:
                 "accepted": accepted,
                 "status": status,
                 "changed_files": changed_files,
+                "command_showcase": command_showcase,
+                "files_showcase": files_showcase,
                 "memory_commits": memory_commit_count,
                 "raw_video": str(output / "gui-raw.mp4"),
                 "result": str(output / "result.json"),

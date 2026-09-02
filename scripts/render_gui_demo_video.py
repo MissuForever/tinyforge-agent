@@ -73,7 +73,7 @@ def make_intro(path: Path, result: dict[str, Any]) -> None:
     draw.text((72, 174), "从缺陷到验证，再到可复用记忆", font=font(SANS_BOLD, 58), fill=TEXT)
     draw.text(
         (72, 260),
-        "真实模型调用 · 原生桌面 GUI · 完整工具时间线",
+        "真实模型调用 · 原生桌面 GUI · 文件与工具证据",
         font=font(SANS, 29),
         fill=CYAN,
     )
@@ -143,10 +143,27 @@ def make_outro(path: Path, result: dict[str, Any]) -> None:
     image.save(path, optimize=True)
 
 
+def memory_evidence_lines(memory: str) -> tuple[str, str]:
+    edit = re.search(r"\b(e\d+)=edit_file:([^|\n]+)", memory)
+    verification = re.search(r"\b(e\d+)=run_command:exit=0 for ([^|\n]+)", memory)
+    edit_line = (
+        f"{edit.group(1)}  edit_file: {edit.group(2).strip()}"
+        if edit is not None
+        else "verified  edit_file: pricing.py"
+    )
+    verification_line = (
+        f"{verification.group(1)}  run_command: 4 tests OK, exit=0"
+        if verification is not None
+        else "verified  run_command: 4 tests OK, exit=0"
+    )
+    return edit_line, verification_line
+
+
 def make_memory_card(path: Path, result: dict[str, Any]) -> None:
     memory = str(result.get("memory", ""))
     identifier_match = re.search(r"\[(sop:[^\]]+)\]", memory)
     identifier = identifier_match.group(1) if identifier_match else "sop:verified"
+    edit_evidence, verification_evidence = memory_evidence_lines(memory)
     image = Image.new("RGB", (WIDTH, HEIGHT), BG)
     draw = ImageDraw.Draw(image)
     header(draw, "PERSISTENT MEMORY")
@@ -167,13 +184,13 @@ def make_memory_card(path: Path, result: dict[str, Any]) -> None:
     )
     draw.text(
         (110, 570),
-        "e11  edit_file: pricing.py (replacements=1)",
+        edit_evidence,
         font=font(MONO, 24),
         fill=MUTED,
     )
     draw.text(
         (110, 626),
-        "e12  run_command: 4 tests OK, exit=0",
+        verification_evidence,
         font=font(MONO, 24),
         fill=YELLOW,
     )
@@ -533,7 +550,7 @@ def make_live_footer(
     )
     draw.text(
         (72, gui_height + 102),
-        f"{result['configuration']['model']}  |  Responses API  |  Persistent memory",
+        f"{result['configuration']['model']}  |  Responses API  |  Files  |  Memory",
         font=font(SANS, 25),
         fill=TEXT,
     )
@@ -698,6 +715,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         and result.get("changed_files") == ["pricing.py"]
         and result.get("change_count", 0) >= 1
         and result.get("memory_commit_count", 0) >= 1
+        and result.get("command_showcase", {}).get("visible")
+        and result.get("command_showcase", {}).get("height", 0) >= 120
+        and result.get("command_showcase", {}).get("count", 0) >= 2
+        and result.get("command_showcase", {}).get("has_failed_baseline")
+        and result.get("command_showcase", {}).get("has_successful_verification")
+        and result.get("files_showcase", {}).get("indexed")
+        and result.get("files_showcase", {}).get("selected")
+        and result.get("files_showcase", {}).get("preview_ready")
+        and "M" in str(result.get("files_showcase", {}).get("git_status", ""))
+        and result.get("files_marker_recorded")
         and has_ordered_gui_test_evidence(result)
         and raw_video.is_file()
     )
@@ -757,8 +784,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         (
             live_time(terminal) + 0.8,
-            "任务完成后，画面依次回看关键证据：最初四项测试中三项失败；统一差异只包含 pricing 点 py；"
-            "再次测试四项全过；记忆页保存了带执行证据的 SOP。",
+            "任务完成后开始回看证据：最初四项测试中三项失败，统一差异只包含 pricing 点 py，"
+            "再次执行同一命令后四项全部通过。",
+        ),
+        (
+            live_time(marker_time(result, "workspace_files", terminal + 18.0)) + 0.5,
+            "左侧工作区同步显示目录结构和 Git 状态。pricing 点 py 标记为已修改，文件树下方可直接查看带行号的安全只读预览。",
         ),
         (
             INTRO_SECONDS + gui_duration + 0.5,

@@ -2,7 +2,7 @@
 
 这套流程录制真实的 TinyForge 桌面操作台，不使用伪造事件或预先写好的修复结果。录制脚本
 会准备独立缺陷项目、启动 PySide6 GUI、调用真实模型完成修复，并自动回看测试、Diff、
-记忆和最终结果；渲染脚本再加入中文旁白、标题卡和总结卡。
+文件总览、记忆和最终结果；渲染脚本再加入中文旁白、标题卡和总结卡。
 
 ## 录制前
 
@@ -46,7 +46,7 @@ Remove-Item Env:QT_QPA_PLATFORM
 执行：
 
 ```powershell
-python scripts/record_gui_demo.py --output .demo/gui-video-pyside6-final --force --timeout 600
+python scripts/record_gui_demo.py --output .demo/gui-video-layout-final --force --timeout 600
 ```
 
 `--output` 必须位于 `.demo` 下；`--force` 会删除并重建指定输出目录。`--timeout` 是 Agent
@@ -54,21 +54,22 @@ python scripts/record_gui_demo.py --output .demo/gui-video-pyside6-final --force
 
 脚本会自动完成以下演示流程：
 
-1. 调用 `scripts/prepare_demo.py` 创建全新的 `workspace`。
+1. 调用 `scripts/prepare_demo.py` 创建全新的 `workspace`，并建立隔离的本地 Git 基线。
 2. 在录制前确认演示项目共有 4 项测试，其中 3 项失败。
 3. 优先选择第一个非主显示器；没有副屏时才回退主屏。在目标屏幕可用区域中央打开标题为
-   `TinyForge 0.3.0 - Live GUI Demo`、约 `1020x640` 的普通独立 PySide6 窗口。脚本不调用
+   `TinyForge 0.3.0 - Live GUI Demo`、约 `1020x720` 的普通独立 PySide6 窗口。脚本不调用
    `raise_()` 或 `activateWindow()`，不会主动抢占用户的键盘焦点，也不要求手动拖动窗口。
 4. 自动输入任务，要求 Agent 先建立失败基线，只修改 `pricing.py`，再次运行完整测试，并
    使用 `stage_memory` 保存带验证证据的 SOP。
-5. 在执行时间线中展示模型轮次、文件读取、精确编辑、命令输出和记忆提交。
-6. Agent 结束后依次回看最终 Result、失败测试、统一 Diff、成功测试和持久记忆。
+5. 在中间区域同步展示执行时间线，以及下方独立的命令、输出和退出状态。
+6. Agent 结束后依次回看最终 Result、失败测试、统一 Diff、左侧 Workspace 中的 Git 修改
+   状态和 `pricing.py` 只读预览、成功测试及持久记忆。
 7. 在 GUI 关闭后独立复跑 4 项测试，并检查只改动了 `pricing.py`。
 
 录制成功时，终端最后输出的 JSON 必须包含：
 
 ```json
-{"accepted": true, "status": "Completed", "changed_files": ["pricing.py"]}
+{"accepted": true, "status": "Completed", "changed_files": ["pricing.py"], "command_showcase": {"visible": true, "count": 2}}
 ```
 
 录制不是按窗口标题估算画面范围：脚本通过 Win32 DWM 读取窗口的实际可见物理边界，DWM
@@ -76,7 +77,7 @@ python scripts/record_gui_demo.py --output .demo/gui-video-pyside6-final --force
 系统缩放和窗口边框都会计入抓取区域，`result.json` 也会记录 `capture_screen` 和
 `capture_region` 便于复核。
 
-主要录制产物位于 `.demo/gui-video-pyside6-final/`：
+主要录制产物位于 `.demo/gui-video-layout-final/`：
 
 - `gui-raw.mp4`：无旁白的真实 GUI 窗口录制；
 - `capture-reference.png`：Qt 在录制开始前保存的窗口参考图；
@@ -87,7 +88,7 @@ python scripts/record_gui_demo.py --output .demo/gui-video-pyside6-final --force
 - `state/`：本次演示使用的隔离记忆状态。
 
 如果 `accepted` 为 `false`，不要继续渲染。先检查 `result.json` 和日志；脚本会拒绝测试证据
-不完整、改动文件不正确、记忆未提交或 FFmpeg 失败的录制。
+不完整、命令面板不可见、改动文件不正确、记忆未提交或 FFmpeg 失败的录制。
 
 ## 演示内容
 
@@ -95,7 +96,8 @@ python scripts/record_gui_demo.py --output .demo/gui-video-pyside6-final --force
 
 - 8 秒标题卡：说明“真实模型调用、原生桌面 GUI、完整工具时间线”；
 - GUI 主体：输入带约束的任务，观察 Agent 建立基线、读取代码、修改实现和执行验证；
-- 证据回看：展示 3 项初始失败、仅含 `pricing.py` 的 Diff、4 项测试全过；
+- 证据回看：展示命令面板中的 3 项初始失败、仅含 `pricing.py` 的 Diff、Workspace 文件树
+  与 Git 状态、带行号的代码预览以及命令面板中的 4 项测试全过；
 - 9 秒记忆卡：展示 SOP 内容及其修改、测试证据；
 - 11 秒总结卡：展示完成状态、工具统计和主项目完整测试通过。
 
@@ -109,8 +111,8 @@ python scripts/record_gui_demo.py --output .demo/gui-video-pyside6-final --force
 
 ```powershell
 python scripts/render_gui_demo_video.py `
-  --input .demo/gui-video-pyside6-final `
-  --output .demo/gui-video-pyside6-final/TinyForge-GUI-demo.mp4 `
+  --input .demo/gui-video-layout-final `
+  --output .demo/gui-video-layout-final/TinyForge-GUI-Layout-demo-2min.mp4 `
   --max-gui-seconds 92 `
   --tts-backend edge `
   --edge-voice zh-CN-XiaoxiaoNeural `
@@ -128,17 +130,18 @@ python scripts/render_gui_demo_video.py `
 内嵌 AAC 音轨，播放时不需要联网或安装 TTS。
 脚本会检查最终文件包含 `1920x1080` H.264 视频和 AAC 音频，并输出：
 
-- `.demo/gui-video-pyside6-final/TinyForge-GUI-demo.mp4`：最终成片；
-- `.demo/gui-video-pyside6-final/video-manifest.json`：时长、分辨率、帧率、加速比例、旁白时间点，
+- `.demo/gui-video-layout-final/TinyForge-GUI-Layout-demo-2min.mp4`：最终成片；
+- `.demo/gui-video-layout-final/video-manifest.json`：时长、分辨率、帧率、加速比例、旁白时间点，
   以及请求/实际 TTS 后端、音色、语速、采样率和回退状态；
-- `.demo/gui-video-pyside6-final/render-gui/`：标题卡、记忆卡、总结卡和旁白等中间产物。
+- `.demo/gui-video-layout-final/render-gui/`：标题卡、记忆卡、总结卡和旁白等中间产物。
 
 ## 提交前检查
 
 - 主项目离线测试全部通过，GUI smoke 通过；
 - 录制命令退出码为 0，终端摘要中 `accepted` 为 `true`；`result.json` 中状态为
   `Completed`，4 项演示测试最终全部通过；
-- 视频中能看清执行时间线、失败基线、`pricing.py` Diff、成功验证、Memory 和 Result；
+- 视频中能看清执行时间线、命令面板内的失败基线与成功验证、`pricing.py` Diff、Workspace
+  的 `M` 状态与代码预览、Memory 和 Result；
 - 画面、声音、日志和 JSON 中没有 API Key、`.env` 内容、认证头或其他凭据；
 - 最终文件为 MP4，分辨率、音视频流、时长和文件大小符合提交平台要求；
 - 将 `README.txt` 中的占位地址替换为真实公开仓库地址；
