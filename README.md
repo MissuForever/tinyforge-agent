@@ -198,8 +198,10 @@ query 时按当前任务推荐最多 10 项，显式传空 query 才浏览目录
 embedding 相似度证明，最后仍由主模型判断是否相关。模型确认后调用 `load_skill` 读取一个
 `SKILL.md`；只有该 Skill 已加载，`read_skill_resource` 才能按行读取
 它引用的受支持文本资源。ID 使用 `user:<name>` 或 `workspace:<name>`，同名时必须写完整 ID。
-仓库中的 `workspace:verified-bugfix` 示例要求先复现失败，再做最小修改，并用修改后的测试
-结果证明修复。可用上面的 `--skills` 命令直接演示。
+仓库提供 6 个工作区 Skills：`verified-bugfix` 用前后测试证据修复可复现缺陷，
+`tested-feature` 实现带自动测试的新行为，`behavior-preserving-refactor` 约束无行为变化的重构，
+`gui-change-verification` 验证桌面交互和界面状态，`dependency-upgrade` 控制依赖与兼容性变化，
+`security-code-review` 审查信任边界和可达漏洞。可用上面的 `--skills` 命令直接演示。
 
 成功加载会记录 `SKILL.md` SHA-256、资源 manifest 和加载步骤。可读资源在加载时冻结文件
 签名与内容 SHA-256；本任务中若资源被替换、修改或事后新增，读取会失败并要求重新开始会话，
@@ -254,24 +256,6 @@ Remove-Item Env:QT_QPA_PLATFORM
 
 该检查只验证 Qt 应用、主窗口和核心控件能够完成构造与销毁，不会发起模型请求。实际界面
 仍应在系统缩放开启的显示器上检查一次，确认字体、分栏和按钮在目标 DPI 下完整显示。
-
-## 两分钟演示
-
-生成一个带真实缺陷和测试的独立工作区：
-
-```powershell
-py -3 scripts/prepare_demo.py
-py -3 -m unittest discover -s .demo/order_total/tests -t .demo/order_total -v
-```
-
-第一次测试应失败。随后运行：
-
-```powershell
-py -3 -m tinyforge -w .demo/order_total "阅读 README 和测试，修复订单总价计算；不要修改测试，运行全部测试验证结果。"
-```
-
-演示结束后再次运行测试，展示全部通过。重复录制前执行
-`py -3 scripts/prepare_demo.py --force` 即可恢复初始缺陷。
 
 ## 已知边界
 
