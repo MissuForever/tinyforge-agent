@@ -16,5 +16,8 @@ Agent论文/
 /2_Skill论文/
 /推免考核题目学生版.md
 /docs/
+/scripts/record_gui_demo.py
+/scripts/render_gui_demo_video.py
+/tests/test_render_gui_demo_video.py
 .idea/
 .vscode/

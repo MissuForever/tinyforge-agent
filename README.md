@@ -257,15 +257,6 @@ Remove-Item Env:QT_QPA_PLATFORM
 
 ## 两分钟演示
 
-完整 GUI 录制与神经语音渲染依赖可单独安装，不影响核心 Runtime：
-
-```powershell
-py -3 -m pip install -e ".[demo]"
-```
-
-默认渲染优先使用联网的 `zh-CN-XiaoxiaoNeural`，失败时整批回退到 Windows 已安装的本地
-语音；最终 MP4 的音轨可完全离线播放。
-
 生成一个带真实缺陷和测试的独立工作区：
 
 ```powershell
