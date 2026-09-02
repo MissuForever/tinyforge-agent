@@ -157,10 +157,6 @@ tinyforge-gui --help
 - `tinyforge/workspace_view.py`：GUI 文件索引、Git 状态和安全预览
 - `tinyforge/gui.py`：基于 PySide6 / Qt Widgets 的桌面界面
 
-更完整的设计说明和面试问答见 [`docs/design.md`](docs/design.md)，录制流程见
-[`docs/demo-script.md`](docs/demo-script.md)。论文机制、实现映射和证据边界见
-[`docs/paper-improvements.md`](docs/paper-improvements.md)。
-
 ## 分层记忆
 
 持久记忆默认保存在 `~/.tinyforge/workspaces/<workspace-hash>/`，不写入目标仓库：
@@ -268,8 +264,7 @@ py -3 -m pip install -e ".[demo]"
 ```
 
 默认渲染优先使用联网的 `zh-CN-XiaoxiaoNeural`，失败时整批回退到 Windows 已安装的本地
-语音；最终 MP4 的音轨可完全离线播放。可复现录制、严格两分钟渲染和代理参数见
-[`docs/demo-script.md`](docs/demo-script.md)。
+语音；最终 MP4 的音轨可完全离线播放。
 
 生成一个带真实缺陷和测试的独立工作区：
 
